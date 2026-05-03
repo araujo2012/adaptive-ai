@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import pickle
@@ -44,10 +45,18 @@ class Storage:
         self.mark_interrupted_jobs()
         self.cleanup_pending_dataset_chunks()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, check_same_thread=False)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as connection:
@@ -202,6 +211,15 @@ class Storage:
     def dataset_file(self) -> Path:
         return self.arrays_path / "dataset.npz"
 
+    def has_legacy_dataset_without_chunks(self) -> bool:
+        return self.dataset_file().exists() and self.get_sample_count() == 0
+
+    def raise_if_legacy_dataset_requires_migration(self) -> None:
+        if self.has_legacy_dataset_without_chunks():
+            raise ValueError(
+                "legacy dataset.npz storage requires chunked migration before streaming access"
+            )
+
     def save_dataset(self, inputs: np.ndarray, outputs: np.ndarray) -> None:
         self.replace_dataset(inputs, outputs)
 
@@ -214,13 +232,9 @@ class Storage:
             }
 
         path = self.dataset_file()
-        if not path.exists():
-            raise ValueError("dataset has not been set")
-        with np.load(path) as data:
-            return {
-                "inputs": data["inputs"].astype(np.float64, copy=False),
-                "outputs": data["outputs"].astype(np.float64, copy=False),
-            }
+        if path.exists():
+            self.raise_if_legacy_dataset_requires_migration()
+        raise ValueError("dataset has not been set")
 
     def clear_dataset(self) -> None:
         with self._lock, self._connect() as connection:
@@ -245,8 +259,9 @@ class Storage:
         *,
         sample_ids: Iterable[object] | None = None,
     ) -> dict[str, int]:
+        rows = _prepare_dataset_rows(inputs, outputs, sample_ids=sample_ids)
         self.clear_dataset()
-        return self.append_dataset(inputs, outputs, sample_ids=sample_ids)
+        return self._append_prepared_dataset(rows)
 
     def append_dataset(
         self,
@@ -255,21 +270,19 @@ class Storage:
         *,
         sample_ids: Iterable[object] | None = None,
     ) -> dict[str, int]:
-        if inputs.shape[0] != outputs.shape[0]:
-            raise ValueError("inputs and outputs must contain the same number of samples")
+        self.raise_if_legacy_dataset_requires_migration()
+        rows = _prepare_dataset_rows(inputs, outputs, sample_ids=sample_ids)
+        return self._append_prepared_dataset(rows)
 
-        ids = (
-            list(sample_ids)
-            if sample_ids is not None
-            else [_generated_sample_id() for _ in range(inputs.shape[0])]
-        )
-        if len(ids) != inputs.shape[0]:
-            raise ValueError("sample_ids must contain one id per sample")
-
+    def _append_prepared_dataset(
+        self,
+        rows: list[tuple[bytes, str, np.ndarray, np.ndarray]],
+    ) -> dict[str, int]:
         ingestion_id = str(uuid.uuid4())
         new_rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
         skipped_rows = 0
         conflict_rows = 0
+        conflict_error: ValueError | None = None
 
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -279,9 +292,7 @@ class Storage:
                 """,
                 (ingestion_id, utc_now()),
             )
-            for sample_id, input_row, output_row in zip(ids, inputs, outputs, strict=True):
-                sample_blob = _sample_id_to_blob(sample_id)
-                fingerprint = _fingerprint_row(input_row, output_row)
+            for sample_blob, fingerprint, input_row, output_row in rows:
                 existing = connection.execute(
                     """
                     SELECT content_fingerprint
@@ -308,8 +319,14 @@ class Storage:
                             ingestion_id,
                         ),
                     )
-                    raise ValueError("conflicting sample_id with different input/output content")
+                    conflict_error = ValueError(
+                        "conflicting sample_id with different input/output content"
+                    )
+                    break
                 new_rows.append((sample_blob, fingerprint, input_row, output_row))
+
+        if conflict_error is not None:
+            raise conflict_error
 
         if not new_rows:
             with self._lock, self._connect() as connection:
@@ -329,67 +346,82 @@ class Storage:
 
         chunk_id = str(uuid.uuid4())
         chunk_dir = self.chunks_path / chunk_id
-        chunk_dir.mkdir(parents=True, exist_ok=False)
-        input_path = chunk_dir / "inputs.npy"
-        output_path = chunk_dir / "outputs.npy"
-        sample_keys_path = chunk_dir / "sample_keys.npy"
-        chunk_inputs = np.asarray([row[2] for row in new_rows], dtype=np.float64)
-        chunk_outputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
-        np.save(input_path, chunk_inputs)
-        np.save(output_path, chunk_outputs)
+        try:
+            chunk_dir.mkdir(parents=True, exist_ok=False)
+            input_path = chunk_dir / "inputs.npy"
+            output_path = chunk_dir / "outputs.npy"
+            sample_keys_path = chunk_dir / "sample_keys.npy"
+            chunk_inputs = np.asarray([row[2] for row in new_rows], dtype=np.float64)
+            chunk_outputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
+            np.save(input_path, chunk_inputs)
+            np.save(output_path, chunk_outputs)
 
-        sample_keys: list[int] = []
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO dataset_chunks(
-                    id, input_path, output_path, sample_keys_path, row_count, status, created_at
-                )
-                VALUES(?, ?, ?, ?, ?, 'pending', ?)
-                """,
-                (
-                    chunk_id,
-                    str(input_path),
-                    str(output_path),
-                    str(sample_keys_path),
-                    len(new_rows),
-                    utc_now(),
-                ),
-            )
-            for row_index, (sample_blob, fingerprint, _, _) in enumerate(new_rows):
-                cursor = connection.execute(
+            sample_keys: list[int] = []
+            with self._lock, self._connect() as connection:
+                connection.execute(
                     """
-                    INSERT INTO dataset_samples(
-                        sample_id_blob, content_fingerprint, chunk_id,
-                        row_index, status, created_at
+                    INSERT INTO dataset_chunks(
+                        id, input_path, output_path, sample_keys_path,
+                        row_count, status, created_at
                     )
-                    VALUES(?, ?, ?, ?, 'pending', ?)
+                    VALUES(?, ?, ?, ?, ?, 'pending', ?)
                     """,
-                    (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                    (
+                        chunk_id,
+                        str(input_path),
+                        str(output_path),
+                        str(sample_keys_path),
+                        len(new_rows),
+                        utc_now(),
+                    ),
                 )
-                sample_keys.append(int(cursor.lastrowid))
+                for row_index, (sample_blob, fingerprint, _, _) in enumerate(new_rows):
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO dataset_samples(
+                            sample_id_blob, content_fingerprint, chunk_id,
+                            row_index, status, created_at
+                        )
+                        VALUES(?, ?, ?, ?, 'pending', ?)
+                        """,
+                        (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                    )
+                    sample_keys.append(int(cursor.lastrowid))
 
-            np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
-            connection.execute(
-                "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
-                (chunk_id,),
-            )
-            connection.execute(
-                "UPDATE dataset_chunks SET status = 'committed', committed_at = ? WHERE id = ?",
-                (utc_now(), chunk_id),
-            )
-            connection.execute(
-                """
-                UPDATE dataset_ingestions
-                SET status = 'committed',
-                    committed_rows = ?,
-                    skipped_rows = ?,
-                    conflict_rows = ?,
-                    finished_at = ?
-                WHERE id = ?
-                """,
-                (len(new_rows), skipped_rows, conflict_rows, utc_now(), ingestion_id),
-            )
+                np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
+                connection.execute(
+                    "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
+                    (chunk_id,),
+                )
+                connection.execute(
+                    "UPDATE dataset_chunks SET status = 'committed', committed_at = ? WHERE id = ?",
+                    (utc_now(), chunk_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'committed',
+                        committed_rows = ?,
+                        skipped_rows = ?,
+                        conflict_rows = ?,
+                        finished_at = ?
+                    WHERE id = ?
+                    """,
+                    (len(new_rows), skipped_rows, conflict_rows, utc_now(), ingestion_id),
+                )
+        except Exception as exc:
+            if chunk_dir.exists():
+                shutil.rmtree(chunk_dir)
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'failed', finished_at = ?, error = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (utc_now(), str(exc), ingestion_id),
+                )
+            raise
 
         return {
             "committed_rows": len(new_rows),
@@ -721,6 +753,34 @@ def _optional_float(value: object) -> float | None:
 
 def _optional_int(value: object) -> int | None:
     return None if value is None else int(value)
+
+
+def _prepare_dataset_rows(
+    inputs: np.ndarray,
+    outputs: np.ndarray,
+    *,
+    sample_ids: Iterable[object] | None,
+) -> list[tuple[bytes, str, np.ndarray, np.ndarray]]:
+    if inputs.shape[0] != outputs.shape[0]:
+        raise ValueError("inputs and outputs must contain the same number of samples")
+
+    ids = (
+        list(sample_ids)
+        if sample_ids is not None
+        else [_generated_sample_id() for _ in range(inputs.shape[0])]
+    )
+    if len(ids) != inputs.shape[0]:
+        raise ValueError("sample_ids must contain one id per sample")
+
+    rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
+    seen_blobs: set[bytes] = set()
+    for sample_id, input_row, output_row in zip(ids, inputs, outputs, strict=True):
+        sample_blob = _sample_id_to_blob(sample_id)
+        if sample_blob in seen_blobs:
+            raise ValueError("duplicate sample_ids are not allowed in one dataset write")
+        seen_blobs.add(sample_blob)
+        rows.append((sample_blob, _fingerprint_row(input_row, output_row), input_row, output_row))
+    return rows
 
 
 def _sample_id_to_blob(sample_id: object) -> bytes:

@@ -64,6 +64,7 @@ class AdaptiveAI:
         self._storage.append_dataset(input_array, output_array, sample_ids=sample_ids)
 
     def get_dataset(self) -> DatasetView:
+        self._storage.raise_if_legacy_dataset_requires_migration()
         dimensions = self._storage.get_dimensions()
         if dimensions is None:
             raise ValueError("dataset has not been set")
