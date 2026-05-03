@@ -4,10 +4,12 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 import pickle
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,13 +28,86 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class _CrossProcessFileLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle: Any | None = None
+
+    def acquire(self, *, blocking: bool) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        self._ensure_lock_byte(handle)
+        while True:
+            try:
+                self._lock_handle(handle)
+            except OSError:
+                if not blocking:
+                    handle.close()
+                    return False
+                time.sleep(0.05)
+            else:
+                self._handle = handle
+                return True
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        handle = self._handle
+        self._handle = None
+        try:
+            self._unlock_handle(handle)
+        finally:
+            handle.close()
+
+    def _ensure_lock_byte(self, handle: Any) -> None:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+
+    def _lock_handle(self, handle: Any) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_handle(self, handle: Any) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class _ProcessDatasetLockState:
+    def __init__(self) -> None:
+        self.guard = threading.Lock()
+        self.file_lock: _CrossProcessFileLock | None = None
+        self.count = 0
+
+
 class Storage:
     _active_dataset_ingestions: ClassVar[set[str]] = set()
     _active_dataset_ingestions_lock: ClassVar[threading.Lock] = threading.Lock()
+    _dataset_write_lock_states: ClassVar[dict[Path, _ProcessDatasetLockState]] = {}
+    _dataset_write_lock_states_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, root_path: Path):
         self.root_path = root_path
         self.base_path = root_path / ".adaptive_ai"
+        self.dataset_lock_path = self.base_path / "dataset.lock"
         self.arrays_path = self.base_path / "arrays"
         self.dataset_path = self.arrays_path / "dataset"
         self.chunks_path = self.dataset_path / "chunks"
@@ -247,7 +322,84 @@ class Storage:
         with cls._active_dataset_ingestions_lock:
             return list(cls._active_dataset_ingestions)
 
+    @classmethod
+    def _dataset_lock_state_for(cls, lock_path: Path) -> _ProcessDatasetLockState:
+        lock_key = lock_path.resolve()
+        with cls._dataset_write_lock_states_lock:
+            state = cls._dataset_write_lock_states.get(lock_key)
+            if state is None:
+                state = _ProcessDatasetLockState()
+                cls._dataset_write_lock_states[lock_key] = state
+            return state
+
+    @contextmanager
+    def _dataset_write_lock(
+        self,
+        *,
+        blocking: bool = True,
+        share_existing: bool = True,
+    ) -> Iterator[bool]:
+        state = self._dataset_lock_state_for(self.dataset_lock_path)
+        acquired = False
+        try:
+            while not acquired:
+                with state.guard:
+                    if state.count > 0:
+                        if not share_existing:
+                            yield False
+                            return
+                        state.count += 1
+                        acquired = True
+                        break
+
+                file_lock = _CrossProcessFileLock(self.dataset_lock_path)
+                if not file_lock.acquire(blocking=False):
+                    if not blocking:
+                        yield False
+                        return
+                    time.sleep(0.05)
+                    continue
+
+                keep_file_lock = False
+                with state.guard:
+                    if state.count == 0:
+                        state.file_lock = file_lock
+                        state.count = 1
+                        keep_file_lock = True
+                        acquired = True
+                    elif share_existing:
+                        state.count += 1
+                        acquired = True
+                if not keep_file_lock:
+                    file_lock.release()
+                if not acquired:
+                    if not blocking:
+                        yield False
+                        return
+                    time.sleep(0.05)
+            yield True
+        finally:
+            if not acquired:
+                return
+            file_lock_to_release: _CrossProcessFileLock | None = None
+            with state.guard:
+                state.count -= 1
+                if state.count == 0:
+                    file_lock_to_release = state.file_lock
+                    state.file_lock = None
+            if file_lock_to_release is not None:
+                file_lock_to_release.release()
+
     def cleanup_pending_dataset_chunks(self) -> None:
+        with self._dataset_write_lock(
+            blocking=False,
+            share_existing=False,
+        ) as cleanup_lock_acquired:
+            if not cleanup_lock_acquired:
+                return
+            self._cleanup_pending_dataset_chunks_locked()
+
+    def _cleanup_pending_dataset_chunks_locked(self) -> None:
         active_ingestion_ids = self._active_dataset_ingestion_ids()
         with self._lock, self._connect() as connection:
             if active_ingestion_ids:
@@ -420,7 +572,8 @@ class Storage:
         sample_ids: Iterable[object] | None = None,
     ) -> dict[str, int]:
         rows = _prepare_dataset_rows(inputs, outputs, sample_ids=sample_ids)
-        return self._replace_prepared_dataset(rows)
+        with self._dataset_write_lock():
+            return self._replace_prepared_dataset(rows)
 
     def append_dataset(
         self,
@@ -438,11 +591,12 @@ class Storage:
         rows: list[PreparedDatasetRow],
     ) -> dict[str, int]:
         ingestion_id = str(uuid.uuid4())
-        self._register_active_dataset_ingestion(ingestion_id)
-        try:
-            return self._append_prepared_dataset_for_ingestion(rows, ingestion_id)
-        finally:
-            self._unregister_active_dataset_ingestion(ingestion_id)
+        with self._dataset_write_lock():
+            self._register_active_dataset_ingestion(ingestion_id)
+            try:
+                return self._append_prepared_dataset_for_ingestion(rows, ingestion_id)
+            finally:
+                self._unregister_active_dataset_ingestion(ingestion_id)
 
     def _append_prepared_dataset_for_ingestion(
         self,

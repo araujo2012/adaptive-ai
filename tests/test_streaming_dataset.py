@@ -1,6 +1,11 @@
 from contextlib import contextmanager
+from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+import textwrap
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -30,6 +35,21 @@ def _contains_integrity_error(exc):
         else:
             exc = None
     return False
+
+
+def _wait_for_path(path, process, stdout, stderr, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if process.poll() is not None:
+            out = stdout.read() if stdout is not None else ""
+            err = stderr.read() if stderr is not None else ""
+            pytest.fail(
+                "append subprocess exited before signaling pending chunk\n"
+                f"stdout:\n{out}\nstderr:\n{err}"
+            )
+        if time.monotonic() >= deadline:
+            pytest.fail("append subprocess did not signal pending chunk in time")
+        time.sleep(0.01)
 
 
 def _run_concurrent_appends(tmp_path, monkeypatch, jobs):
@@ -529,46 +549,94 @@ def test_failed_append_marks_ingestion_failed_when_cleanup_fails(tmp_path, monke
     assert running_count == 0
 
 
-def test_storage_startup_cleanup_does_not_delete_live_append_chunk(tmp_path, monkeypatch):
+def test_storage_startup_cleanup_does_not_delete_live_append_chunk(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0]], [[0]], sample_ids=["base"])
 
-    first_save_started = threading.Event()
-    release_first_save = threading.Event()
-    original_save = storage_module.np.save
+    ready_path = tmp_path / "append-ready.txt"
+    release_path = tmp_path / "append-release.txt"
+    result_path = tmp_path / "append-result.txt"
+    script = textwrap.dedent(
+        """
+        from pathlib import Path
+        import sys
+        import time
+        import traceback
 
-    def pause_first_append_chunk_save(path, *args, **kwargs):
-        if str(path).endswith("inputs.npy"):
-            first_save_started.set()
-            release_first_save.wait(timeout=5)
-        return original_save(path, *args, **kwargs)
+        from adaptive_ai import AdaptiveAI
+        import adaptive_ai.storage as storage_module
 
-    monkeypatch.setattr(storage_module.np, "save", pause_first_append_chunk_save)
+        root = Path(sys.argv[1])
+        ready_path = Path(sys.argv[2])
+        release_path = Path(sys.argv[3])
+        result_path = Path(sys.argv[4])
 
-    outcome = []
+        ai = AdaptiveAI(path=root)
+        original_save = storage_module.np.save
+        paused = False
 
-    def append_live_chunk():
+        def pause_first_append_chunk_save(path, *args, **kwargs):
+            global paused
+            if not paused and str(path).endswith("inputs.npy"):
+                paused = True
+                ready_path.write_text("ready", encoding="utf-8")
+                deadline = time.monotonic() + 10
+                while not release_path.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("append release was not signaled")
+                    time.sleep(0.01)
+            return original_save(path, *args, **kwargs)
+
+        storage_module.np.save = pause_first_append_chunk_save
+
         try:
             ai.put_input_output(
                 [[1], [2]],
                 [[1], [1]],
                 sample_ids=["live-1", "live-2"],
             )
-        except Exception as exc:
-            outcome.append(exc)
+        except BaseException:
+            result_path.write_text(traceback.format_exc(), encoding="utf-8")
+            raise
         else:
-            outcome.append(None)
+            result_path.write_text("OK", encoding="utf-8")
+        """
+    )
 
-    thread = threading.Thread(target=append_live_chunk)
-    thread.start()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            str(ready_path),
+            str(release_path),
+            str(result_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
-    assert first_save_started.wait(timeout=5)
-    AdaptiveAI(path=tmp_path)
-    release_first_save.set()
-    thread.join(timeout=10)
+    stdout = ""
+    stderr = ""
+    try:
+        _wait_for_path(ready_path, process, process.stdout, process.stderr)
+        AdaptiveAI(path=tmp_path)
+        release_path.write_text("release", encoding="utf-8")
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        release_path.write_text("release", encoding="utf-8")
+        if process.poll() is None:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=10)
 
-    assert not thread.is_alive()
-    assert outcome == [None]
+    assert process.returncode == 0, (
+        result_path.read_text(encoding="utf-8") if result_path.exists() else stderr
+    )
+    assert stdout == ""
+    assert stderr == ""
     assert sorted(_all_sample_ids(ai)) == ["base", "live-1", "live-2"]
 
     db_path = tmp_path / ".adaptive_ai" / "adaptive_ai.sqlite3"
