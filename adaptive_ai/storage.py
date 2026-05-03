@@ -185,10 +185,26 @@ class Storage:
                 (_sample_id_key(sample_id, sample_blob), int(row["key"])),
             )
 
+        duplicate = connection.execute(
+            """
+            SELECT sample_id_key, COUNT(*) AS count
+            FROM dataset_samples
+            WHERE status = 'committed'
+            GROUP BY sample_id_key
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError(
+                "duplicate canonical sample_id values detected during migration"
+            )
+
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS dataset_samples_sample_id_key_idx
             ON dataset_samples(sample_id_key)
+            WHERE status = 'committed'
             """
         )
 
@@ -690,25 +706,36 @@ class Storage:
     def get_sample_count(self) -> int:
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM dataset_samples WHERE status = 'committed'"
+                """
+                SELECT COALESCE(SUM(row_count), 0) AS count
+                FROM dataset_chunks
+                WHERE status = 'committed'
+                """
             ).fetchone()
         return int(row["count"])
 
     def iter_dataset_batches(self, *, batch_size: int) -> Iterator[DatasetBatch]:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT key
-                FROM dataset_samples
-                WHERE status = 'committed'
-                ORDER BY key
-                """
-            ).fetchall()
-        keys = np.asarray([int(row["key"]) for row in rows], dtype=np.uint64)
-        for start in range(0, keys.shape[0], batch_size):
-            batch = self.load_samples_by_keys(keys[start : start + batch_size])
+        last_key = 0
+        while True:
+            with self._lock, self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT key
+                    FROM dataset_samples
+                    WHERE status = 'committed' AND key > ?
+                    ORDER BY key
+                    LIMIT ?
+                    """,
+                    (last_key, batch_size),
+                ).fetchall()
+            if not rows:
+                break
+
+            keys = np.asarray([int(row["key"]) for row in rows], dtype=np.uint64)
+            last_key = int(keys[-1])
+            batch = self.load_samples_by_keys(keys)
             yield DatasetBatch(
                 sample_keys=batch.sample_keys,
                 sample_ids=batch.sample_ids,
@@ -1102,24 +1129,43 @@ def _canonical_json_sample_id(sample_id: object) -> object:
         return ["float", sample_id.hex()]
     if isinstance(sample_id, str):
         return ["str", sample_id]
+    if isinstance(sample_id, bytes):
+        return ["bytes", sample_id.hex()]
+    if isinstance(sample_id, np.generic):
+        return [
+            "numpy-scalar",
+            str(sample_id.dtype),
+            _canonical_json_sample_id(sample_id.item()),
+        ]
     if isinstance(sample_id, list):
         return ["list", [_canonical_json_sample_id(value) for value in sample_id]]
     if isinstance(sample_id, tuple):
         return ["tuple", [_canonical_json_sample_id(value) for value in sample_id]]
+    if isinstance(sample_id, (set, frozenset)):
+        members = []
+        for value in sample_id:
+            canonical_value = _canonical_json_sample_id(value)
+            members.append((_canonical_json_sort_key(canonical_value), canonical_value))
+        tag = "frozenset" if isinstance(sample_id, frozenset) else "set"
+        return [tag, [value for _, value in sorted(members, key=lambda item: item[0])]]
     if isinstance(sample_id, Mapping):
         items = []
         for key, value in sample_id.items():
             canonical_key = _canonical_json_sample_id(key)
             canonical_value = _canonical_json_sample_id(value)
-            sort_key = json.dumps(
-                canonical_key,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
+            sort_key = _canonical_json_sort_key(canonical_key)
             items.append((sort_key, [canonical_key, canonical_value]))
         return ["mapping", [item for _, item in sorted(items, key=lambda item: item[0])]]
     raise TypeError("sample_id is not JSON-like")
+
+
+def _canonical_json_sort_key(canonical_value: object) -> str:
+    return json.dumps(
+        canonical_value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _generated_sample_id() -> str:

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import sqlite3
 
 import numpy as np
@@ -130,6 +131,187 @@ def test_duplicate_mapping_sample_ids_use_canonical_batch_key(tmp_path, monkeypa
             [[0], [1]],
             sample_ids=[{"left": 1, "right": 2}, {"right": 2, "left": 1}],
         )
+
+
+def test_canonical_key_migration_reports_duplicate_ids_clearly(tmp_path):
+    base_path = tmp_path / ".adaptive_ai"
+    chunk_dir = base_path / "arrays" / "dataset" / "chunks" / "old-chunk"
+    chunk_dir.mkdir(parents=True)
+    inputs = np.array([[0.0], [0.0]], dtype=np.float64)
+    outputs = np.array([[0.0], [0.0]], dtype=np.float64)
+    input_path = chunk_dir / "inputs.npy"
+    output_path = chunk_dir / "outputs.npy"
+    sample_keys_path = chunk_dir / "sample_keys.npy"
+    np.save(input_path, inputs)
+    np.save(output_path, outputs)
+    np.save(sample_keys_path, np.array([1, 2], dtype=np.uint64))
+
+    db_path = base_path / "adaptive_ai.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE dataset_chunks (
+                id TEXT PRIMARY KEY,
+                input_path TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                sample_keys_path TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                committed_at TEXT
+            );
+
+            CREATE TABLE dataset_samples (
+                key INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_id_blob BLOB NOT NULL UNIQUE,
+                content_fingerprint TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(chunk_id) REFERENCES dataset_chunks(id)
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO dataset_chunks(
+                id, input_path, output_path, sample_keys_path,
+                row_count, status, created_at, committed_at
+            )
+            VALUES('old-chunk', ?, ?, ?, 2, 'committed', ?, ?)
+            """,
+            (
+                str(input_path),
+                str(output_path),
+                str(sample_keys_path),
+                "2026-05-03T00:00:00+00:00",
+                "2026-05-03T00:00:00+00:00",
+            ),
+        )
+        for row_index, sample_id in enumerate(
+            [{"left": 1, "right": 2}, {"right": 2, "left": 1}]
+        ):
+            connection.execute(
+                """
+                INSERT INTO dataset_samples(
+                    sample_id_blob, content_fingerprint, chunk_id,
+                    row_index, status, created_at
+                )
+                VALUES(?, ?, 'old-chunk', ?, 'committed', ?)
+                """,
+                (
+                    storage_module._sample_id_to_blob(sample_id),
+                    storage_module._fingerprint_row(inputs[row_index], outputs[row_index]),
+                    row_index,
+                    "2026-05-03T00:00:00+00:00",
+                ),
+            )
+
+    with pytest.raises(ValueError, match="(?i)duplicate.*canonical.*sample_id"):
+        AdaptiveAI(path=tmp_path)
+
+    with sqlite3.connect(db_path) as connection:
+        index_row = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index' AND name = 'dataset_samples_sample_id_key_idx'
+            """
+        ).fetchone()
+    assert index_row is None
+
+
+def test_set_sample_ids_are_idempotent_with_different_order(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+
+    first_id = {0, 2**61 - 1}
+    second_id = {2**61 - 1, 0}
+    ai.set_input_output([[0]], [[0]], sample_ids=[first_id])
+    ai.put_input_output([[0]], [[0]], sample_ids=[second_id])
+
+    dataset = ai.get_dataset()
+    assert dataset.sample_count == 1
+    chunk_dirs = sorted(
+        (tmp_path / ".adaptive_ai" / "arrays" / "dataset" / "chunks").iterdir()
+    )
+    assert len(chunk_dirs) == 1
+
+
+def test_dataset_sample_count_uses_committed_chunk_rows(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+    ai.put_input_output([[2]], [[0]], sample_ids=["extra"])
+
+    original_connect = ai._storage._connect
+
+    class GuardedConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if "COUNT(*) AS COUNT FROM DATASET_SAMPLES" in normalized:
+                raise AssertionError("sample count must use committed chunk row counts")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def guarded_connect():
+        with original_connect() as connection:
+            yield GuardedConnection(connection)
+
+    monkeypatch.setattr(ai._storage, "_connect", guarded_connect)
+
+    assert ai.get_dataset().sample_count == 3
+
+
+def test_dataset_iteration_does_not_materialize_all_sample_keys(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+    ai.put_input_output([[2], [3]], [[0], [1]], sample_ids=["third", "fourth"])
+    ai.put_input_output([[4]], [[0]], sample_ids=["fifth"])
+
+    original_connect = ai._storage._connect
+    original_load_samples_by_keys = ai._storage.load_samples_by_keys
+    call_sizes = []
+
+    class GuardedConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if (
+                normalized.startswith("SELECT KEY FROM DATASET_SAMPLES")
+                and " LIMIT " not in normalized
+            ):
+                raise AssertionError("iteration must not scan all sample keys at once")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def guarded_connect():
+        with original_connect() as connection:
+            yield GuardedConnection(connection)
+
+    def record_load_samples_by_keys(sample_keys):
+        call_sizes.append(np.asarray(sample_keys).shape[0])
+        return original_load_samples_by_keys(sample_keys)
+
+    monkeypatch.setattr(ai._storage, "_connect", guarded_connect)
+    monkeypatch.setattr(ai._storage, "load_samples_by_keys", record_load_samples_by_keys)
+
+    batches = list(ai.get_dataset().iter_batches(batch_size=2))
+
+    assert [batch.inputs.shape[0] for batch in batches] == [2, 2, 1]
+    assert call_sizes
+    assert max(call_sizes) <= 2
+    assert len(call_sizes) >= 3
 
 
 def test_dataset_view_does_not_support_full_array_indexing(tmp_path):
