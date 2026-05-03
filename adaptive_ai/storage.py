@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 import hashlib
 import json
@@ -318,14 +318,7 @@ class Storage:
                 (ingestion_id, utc_now()),
             )
             for sample_blob, fingerprint, input_row, output_row in rows:
-                existing = connection.execute(
-                    """
-                    SELECT content_fingerprint
-                    FROM dataset_samples
-                    WHERE sample_id_blob = ? AND status = 'committed'
-                    """,
-                    (sample_blob,),
-                ).fetchone()
+                existing = _find_committed_sample_by_id(connection, sample_blob)
                 if existing is not None:
                     if str(existing["content_fingerprint"]) == fingerprint:
                         skipped_rows += 1
@@ -972,13 +965,81 @@ def _prepare_dataset_rows(
 
     rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
     seen_blobs: set[bytes] = set()
+    seen_value_ids: list[object] = []
     for sample_id, input_row, output_row in zip(ids, inputs, outputs, strict=True):
         sample_blob = _sample_id_to_blob(sample_id)
-        if sample_blob in seen_blobs:
+        needs_value_lookup = _sample_id_needs_value_lookup(sample_id)
+        if sample_blob in seen_blobs or (
+            needs_value_lookup
+            and any(
+                _sample_ids_equal(existing_id, sample_id)
+                for existing_id in seen_value_ids
+            )
+        ):
             raise ValueError("duplicate sample_ids are not allowed in one dataset write")
         seen_blobs.add(sample_blob)
-        rows.append((sample_blob, _fingerprint_row(input_row, output_row), input_row, output_row))
+        if needs_value_lookup:
+            seen_value_ids.append(sample_id)
+        rows.append(
+            (sample_blob, _fingerprint_row(input_row, output_row), input_row, output_row)
+        )
     return rows
+
+
+def _find_committed_sample_by_id(
+    connection: sqlite3.Connection, sample_blob: bytes
+) -> sqlite3.Row | None:
+    existing = connection.execute(
+        """
+        SELECT sample_id_blob, content_fingerprint
+        FROM dataset_samples
+        WHERE sample_id_blob = ? AND status = 'committed'
+        """,
+        (sample_blob,),
+    ).fetchone()
+    if existing is not None:
+        return existing
+
+    sample_id = _sample_id_from_blob(sample_blob)
+    if not _sample_id_needs_value_lookup(sample_id):
+        return None
+
+    rows = connection.execute(
+        """
+        SELECT sample_id_blob, content_fingerprint
+        FROM dataset_samples
+        WHERE status = 'committed'
+        """
+    ).fetchall()
+    for row in rows:
+        if _sample_ids_equal(
+            _sample_id_from_blob(bytes(row["sample_id_blob"])), sample_id
+        ):
+            return row
+    return None
+
+
+def _sample_id_needs_value_lookup(sample_id: object) -> bool:
+    return isinstance(sample_id, Mapping)
+
+
+def _sample_ids_equal(left: object, right: object) -> bool:
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    try:
+        result = left == right
+    except Exception:
+        return False
+    if result is NotImplemented:
+        return False
+    if isinstance(result, (bool, np.bool_)):
+        return bool(result)
+    try:
+        return bool(result)
+    except (TypeError, ValueError):
+        return False
 
 
 def _sample_id_to_blob(sample_id: object) -> bytes:

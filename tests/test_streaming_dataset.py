@@ -37,6 +37,52 @@ def test_set_and_put_input_output_create_chunked_collection(tmp_path):
     )
 
 
+def test_sample_ids_are_exposed_and_duplicate_identical_rows_are_idempotent(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+
+    ai.set_input_output(
+        [[0], [1]],
+        [[0], [1]],
+        sample_ids=["2026-05-02T00:00:00", 123],
+    )
+    ai.put_input_output([[1]], [[1]], sample_ids=[123])
+
+    dataset = ai.get_dataset()
+    assert dataset.sample_count == 2
+    batches = list(dataset.iter_batches(batch_size=10))
+    assert batches[0].sample_ids == ["2026-05-02T00:00:00", 123]
+
+    chunk_dirs = sorted(
+        (tmp_path / ".adaptive_ai" / "arrays" / "dataset" / "chunks").iterdir()
+    )
+    assert len(chunk_dirs) == 1
+
+
+def test_duplicate_sample_id_with_different_content_fails(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["same-id"])
+
+    with pytest.raises(ValueError, match="conflicting sample_id"):
+        ai.put_input_output([[1]], [[0]], sample_ids=["same-id"])
+
+
+def test_equal_opaque_sample_ids_are_idempotent_across_pickle_order(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+
+    ai.set_input_output([[0]], [[0]], sample_ids=[{"left": 1, "right": 2}])
+    ai.put_input_output([[0]], [[0]], sample_ids=[{"right": 2, "left": 1}])
+
+    dataset = ai.get_dataset()
+    assert dataset.sample_count == 1
+    batches = list(dataset.iter_batches(batch_size=10))
+    assert batches[0].sample_ids == [{"left": 1, "right": 2}]
+
+    chunk_dirs = sorted(
+        (tmp_path / ".adaptive_ai" / "arrays" / "dataset" / "chunks").iterdir()
+    )
+    assert len(chunk_dirs) == 1
+
+
 def test_dataset_view_does_not_support_full_array_indexing(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
