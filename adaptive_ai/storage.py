@@ -11,7 +11,7 @@ import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -27,6 +27,9 @@ def utc_now() -> str:
 
 
 class Storage:
+    _active_dataset_ingestions: ClassVar[set[str]] = set()
+    _active_dataset_ingestions_lock: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(self, root_path: Path):
         self.root_path = root_path
         self.base_path = root_path / ".adaptive_ai"
@@ -117,7 +120,8 @@ class Storage:
                     row_count INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    committed_at TEXT
+                    committed_at TEXT,
+                    ingestion_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS dataset_samples (
@@ -156,7 +160,16 @@ class Storage:
                 );
                 """
             )
+            self._ensure_dataset_chunk_ingestion_id(connection)
             self._ensure_dataset_sample_id_key(connection)
+
+    def _ensure_dataset_chunk_ingestion_id(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(dataset_chunks)").fetchall()
+        }
+        if "ingestion_id" not in columns:
+            connection.execute("ALTER TABLE dataset_chunks ADD COLUMN ingestion_id TEXT")
 
     def _ensure_dataset_sample_id_key(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -219,23 +232,73 @@ class Storage:
                 (utc_now(),),
             )
 
+    @classmethod
+    def _register_active_dataset_ingestion(cls, ingestion_id: str) -> None:
+        with cls._active_dataset_ingestions_lock:
+            cls._active_dataset_ingestions.add(ingestion_id)
+
+    @classmethod
+    def _unregister_active_dataset_ingestion(cls, ingestion_id: str) -> None:
+        with cls._active_dataset_ingestions_lock:
+            cls._active_dataset_ingestions.discard(ingestion_id)
+
+    @classmethod
+    def _active_dataset_ingestion_ids(cls) -> list[str]:
+        with cls._active_dataset_ingestions_lock:
+            return list(cls._active_dataset_ingestions)
+
     def cleanup_pending_dataset_chunks(self) -> None:
+        active_ingestion_ids = self._active_dataset_ingestion_ids()
         with self._lock, self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE dataset_ingestions
-                SET status = 'failed', finished_at = ?, error = 'process interrupted'
-                WHERE status = 'running'
-                """,
-                (utc_now(),),
-            )
-            rows = connection.execute(
-                """
-                SELECT id, input_path, output_path, sample_keys_path
-                FROM dataset_chunks
-                WHERE status != 'committed'
-                """
-            ).fetchall()
+            if active_ingestion_ids:
+                active_ingestion_marks = ",".join("?" for _ in active_ingestion_ids)
+                connection.execute(
+                    f"""
+                    UPDATE dataset_ingestions
+                    SET status = 'failed', finished_at = ?, error = 'process interrupted'
+                    WHERE status = 'running'
+                      AND id NOT IN ({active_ingestion_marks})
+                    """,
+                    [utc_now(), *active_ingestion_ids],
+                )
+                active_chunk_rows = connection.execute(
+                    f"""
+                    SELECT id
+                    FROM dataset_chunks
+                    WHERE status != 'committed'
+                      AND ingestion_id IN ({active_ingestion_marks})
+                    """,
+                    active_ingestion_ids,
+                ).fetchall()
+                rows = connection.execute(
+                    f"""
+                    SELECT id, input_path, output_path, sample_keys_path
+                    FROM dataset_chunks
+                    WHERE status != 'committed'
+                      AND (
+                          ingestion_id IS NULL
+                          OR ingestion_id NOT IN ({active_ingestion_marks})
+                      )
+                    """,
+                    active_ingestion_ids,
+                ).fetchall()
+            else:
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'failed', finished_at = ?, error = 'process interrupted'
+                    WHERE status = 'running'
+                    """,
+                    (utc_now(),),
+                )
+                active_chunk_rows = []
+                rows = connection.execute(
+                    """
+                    SELECT id, input_path, output_path, sample_keys_path
+                    FROM dataset_chunks
+                    WHERE status != 'committed'
+                    """
+                ).fetchall()
             committed_rows = connection.execute(
                 """
                 SELECT id
@@ -250,16 +313,32 @@ class Storage:
                     f"DELETE FROM dataset_samples WHERE chunk_id IN ({bind_marks})",
                     noncommitted_chunk_ids,
                 )
-            connection.execute("DELETE FROM dataset_samples WHERE status != 'committed'")
-            connection.execute("DELETE FROM dataset_chunks WHERE status != 'committed'")
+                connection.execute(
+                    f"DELETE FROM dataset_chunks WHERE id IN ({bind_marks})",
+                    noncommitted_chunk_ids,
+                )
+            active_chunk_ids = [str(row["id"]) for row in active_chunk_rows]
+            if active_chunk_ids:
+                active_chunk_marks = ",".join("?" for _ in active_chunk_ids)
+                connection.execute(
+                    f"""
+                    DELETE FROM dataset_samples
+                    WHERE status != 'committed'
+                      AND chunk_id NOT IN ({active_chunk_marks})
+                    """,
+                    active_chunk_ids,
+                )
+            else:
+                connection.execute("DELETE FROM dataset_samples WHERE status != 'committed'")
 
-        committed_chunk_ids = {str(row["id"]) for row in committed_rows}
+        preserved_chunk_ids = {str(row["id"]) for row in committed_rows}
+        preserved_chunk_ids.update(str(row["id"]) for row in active_chunk_rows)
         for row in rows:
             chunk_dir = Path(str(row["input_path"])).parent
             self._remove_tree_best_effort(chunk_dir)
         if self.chunks_path.exists():
             for child in self.chunks_path.iterdir():
-                if child.is_dir() and child.name not in committed_chunk_ids:
+                if child.is_dir() and child.name not in preserved_chunk_ids:
                     self._remove_tree_best_effort(child)
 
     def get_dimensions(self) -> tuple[int, int] | None:
@@ -359,6 +438,17 @@ class Storage:
         rows: list[PreparedDatasetRow],
     ) -> dict[str, int]:
         ingestion_id = str(uuid.uuid4())
+        self._register_active_dataset_ingestion(ingestion_id)
+        try:
+            return self._append_prepared_dataset_for_ingestion(rows, ingestion_id)
+        finally:
+            self._unregister_active_dataset_ingestion(ingestion_id)
+
+    def _append_prepared_dataset_for_ingestion(
+        self,
+        rows: list[PreparedDatasetRow],
+        ingestion_id: str,
+    ) -> dict[str, int]:
         new_rows: list[PreparedDatasetRow] = []
         skipped_rows = 0
         conflict_rows = 0
@@ -421,27 +511,20 @@ class Storage:
 
         chunk_id = str(uuid.uuid4())
         chunk_dir = self.chunks_path / chunk_id
+        input_path = chunk_dir / "inputs.npy"
+        output_path = chunk_dir / "outputs.npy"
+        sample_keys_path = chunk_dir / "sample_keys.npy"
         committed_rows = 0
         remove_uncommitted_chunk = False
         try:
-            chunk_dir.mkdir(parents=True, exist_ok=False)
-            input_path = chunk_dir / "inputs.npy"
-            output_path = chunk_dir / "outputs.npy"
-            sample_keys_path = chunk_dir / "sample_keys.npy"
-            chunk_inputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
-            chunk_outputs = np.asarray([row[4] for row in new_rows], dtype=np.float64)
-            np.save(input_path, chunk_inputs)
-            np.save(output_path, chunk_outputs)
-
-            sample_keys: list[int] = []
             with self._lock, self._connect() as connection:
                 connection.execute(
                     """
                     INSERT INTO dataset_chunks(
                         id, input_path, output_path, sample_keys_path,
-                        row_count, status, created_at
+                        row_count, status, created_at, ingestion_id
                     )
-                    VALUES(?, ?, ?, ?, ?, 'pending', ?)
+                    VALUES(?, ?, ?, ?, ?, 'pending', ?, ?)
                     """,
                     (
                         chunk_id,
@@ -450,8 +533,18 @@ class Storage:
                         str(sample_keys_path),
                         0,
                         utc_now(),
+                        ingestion_id,
                     ),
                 )
+
+            chunk_dir.mkdir(parents=True, exist_ok=False)
+            chunk_inputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
+            chunk_outputs = np.asarray([row[4] for row in new_rows], dtype=np.float64)
+            np.save(input_path, chunk_inputs)
+            np.save(output_path, chunk_outputs)
+
+            sample_keys: list[int] = []
+            with self._lock, self._connect() as connection:
                 for row_index, (
                     sample_blob,
                     sample_id_key,
@@ -577,6 +670,7 @@ class Storage:
                     )
         except Exception as exc:
             self._mark_dataset_ingestion_failed(ingestion_id, str(exc))
+            self._delete_dataset_chunk_records_best_effort(chunk_id)
             self._remove_tree_best_effort(chunk_dir)
             raise
 
@@ -769,6 +863,17 @@ class Storage:
                     """,
                     (utc_now(), error, ingestion_id),
                 )
+        except Exception:
+            pass
+
+    def _delete_dataset_chunk_records_best_effort(self, chunk_id: str) -> None:
+        try:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM dataset_samples WHERE chunk_id = ?",
+                    (chunk_id,),
+                )
+                connection.execute("DELETE FROM dataset_chunks WHERE id = ?", (chunk_id,))
         except Exception:
             pass
 

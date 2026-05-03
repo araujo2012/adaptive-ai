@@ -529,6 +529,77 @@ def test_failed_append_marks_ingestion_failed_when_cleanup_fails(tmp_path, monke
     assert running_count == 0
 
 
+def test_storage_startup_cleanup_does_not_delete_live_append_chunk(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["base"])
+
+    first_save_started = threading.Event()
+    release_first_save = threading.Event()
+    original_save = storage_module.np.save
+
+    def pause_first_append_chunk_save(path, *args, **kwargs):
+        if str(path).endswith("inputs.npy"):
+            first_save_started.set()
+            release_first_save.wait(timeout=5)
+        return original_save(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.np, "save", pause_first_append_chunk_save)
+
+    outcome = []
+
+    def append_live_chunk():
+        try:
+            ai.put_input_output(
+                [[1], [2]],
+                [[1], [1]],
+                sample_ids=["live-1", "live-2"],
+            )
+        except Exception as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    thread = threading.Thread(target=append_live_chunk)
+    thread.start()
+
+    assert first_save_started.wait(timeout=5)
+    AdaptiveAI(path=tmp_path)
+    release_first_save.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert outcome == [None]
+    assert sorted(_all_sample_ids(ai)) == ["base", "live-1", "live-2"]
+
+    db_path = tmp_path / ".adaptive_ai" / "adaptive_ai.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        running_count = connection.execute(
+            "SELECT COUNT(*) FROM dataset_ingestions WHERE status = 'running'"
+        ).fetchone()[0]
+        chunk = connection.execute(
+            """
+            SELECT id, sample_keys_path, row_count
+            FROM dataset_chunks
+            WHERE status = 'committed' AND row_count = 2
+            """
+        ).fetchone()
+        assert chunk is not None
+        sample_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM dataset_samples
+            WHERE chunk_id = ? AND status = 'committed'
+            """,
+            (chunk[0],),
+        ).fetchone()[0]
+
+    assert running_count == 0
+    assert sample_count == 2
+    sample_keys = np.load(chunk[1])
+    assert sample_keys.shape == (2,)
+    assert int(chunk[2]) == 2
+
+
 def test_startup_cleanup_marks_running_ingestions_and_removes_orphan_chunk_dirs(tmp_path):
     AdaptiveAI(path=tmp_path)
 
