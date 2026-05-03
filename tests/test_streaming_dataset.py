@@ -1,11 +1,76 @@
 from contextlib import contextmanager
 import sqlite3
+import threading
 
 import numpy as np
 import pytest
 
 from adaptive_ai import AdaptiveAI
 import adaptive_ai.storage as storage_module
+
+
+def _all_sample_ids(ai):
+    return [
+        sample_id
+        for batch in ai.get_dataset().iter_batches(batch_size=10)
+        for sample_id in batch.sample_ids
+    ]
+
+
+def _contains_integrity_error(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, sqlite3.IntegrityError):
+            return True
+        seen.add(id(exc))
+        if exc.__cause__ is not None:
+            exc = exc.__cause__
+        elif not exc.__suppress_context__:
+            exc = exc.__context__
+        else:
+            exc = None
+    return False
+
+
+def _run_concurrent_appends(tmp_path, monkeypatch, jobs):
+    start_barrier = threading.Barrier(len(jobs))
+    write_barrier = threading.Barrier(len(jobs))
+    outcomes = []
+    outcomes_lock = threading.Lock()
+    original_save = storage_module.np.save
+
+    def synchronized_chunk_input_save(path, *args, **kwargs):
+        if str(path).endswith("inputs.npy"):
+            write_barrier.wait(timeout=5)
+        return original_save(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.np, "save", synchronized_chunk_input_save)
+
+    def run_job(job):
+        ai = AdaptiveAI(path=tmp_path)
+        try:
+            start_barrier.wait(timeout=5)
+            ai.put_input_output(
+                job["inputs"],
+                job["outputs"],
+                sample_ids=[job["sample_id"]],
+            )
+        except Exception as exc:
+            outcome = exc
+        else:
+            outcome = None
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=run_job, args=(job,)) for job in jobs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(outcomes) == len(jobs)
+    return outcomes
 
 
 def test_set_and_put_input_output_create_chunked_collection(tmp_path):
@@ -71,6 +136,48 @@ def test_duplicate_sample_id_with_different_content_fails(tmp_path):
 
     assert ai.get_dataset().sample_count == before_count
     assert sorted(chunks_dir.iterdir()) == before_chunks
+
+
+def test_concurrent_identical_appends_are_idempotent(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["base"])
+
+    outcomes = _run_concurrent_appends(
+        tmp_path,
+        monkeypatch,
+        [
+            {"inputs": [[1]], "outputs": [[1]], "sample_id": "dup"},
+            {"inputs": [[1]], "outputs": [[1]], "sample_id": "dup"},
+        ],
+    )
+
+    assert not any(_contains_integrity_error(outcome) for outcome in outcomes)
+    assert all(outcome is None for outcome in outcomes)
+    dataset = ai.get_dataset()
+    assert dataset.sample_count == 2
+    assert _all_sample_ids(ai).count("dup") == 1
+
+
+def test_concurrent_conflicting_appends_return_clear_conflict(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["base"])
+
+    outcomes = _run_concurrent_appends(
+        tmp_path,
+        monkeypatch,
+        [
+            {"inputs": [[1]], "outputs": [[1]], "sample_id": "race"},
+            {"inputs": [[2]], "outputs": [[1]], "sample_id": "race"},
+        ],
+    )
+
+    errors = [outcome for outcome in outcomes if outcome is not None]
+    assert not any(_contains_integrity_error(outcome) for outcome in outcomes)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "conflicting sample_id" in str(errors[0])
+    assert ai.get_dataset().sample_count == 2
+    assert _all_sample_ids(ai).count("race") == 1
 
 
 def test_equal_opaque_sample_ids_are_idempotent_across_pickle_order(tmp_path):

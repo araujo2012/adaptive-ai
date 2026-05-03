@@ -421,6 +421,8 @@ class Storage:
 
         chunk_id = str(uuid.uuid4())
         chunk_dir = self.chunks_path / chunk_id
+        committed_rows = 0
+        remove_uncommitted_chunk = False
         try:
             chunk_dir.mkdir(parents=True, exist_ok=False)
             input_path = chunk_dir / "inputs.npy"
@@ -446,7 +448,7 @@ class Storage:
                         str(input_path),
                         str(output_path),
                         str(sample_keys_path),
-                        len(new_rows),
+                        0,
                         utc_now(),
                     ),
                 )
@@ -457,53 +459,134 @@ class Storage:
                     _,
                     _,
                 ) in enumerate(new_rows):
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO dataset_samples(
-                            sample_id_blob, sample_id_key, content_fingerprint, chunk_id,
-                            row_index, status, created_at
+                    existing = _find_committed_sample_by_id(connection, sample_id_key)
+                    if existing is not None:
+                        if str(existing["content_fingerprint"]) == fingerprint:
+                            skipped_rows += 1
+                            continue
+                        conflict_rows += 1
+                        conflict_error = ValueError(
+                            "conflicting sample_id with different input/output content"
                         )
-                        VALUES(?, ?, ?, ?, ?, 'pending', ?)
-                        """,
-                        (
-                            sample_blob,
-                            sample_id_key,
-                            fingerprint,
-                            chunk_id,
-                            row_index,
-                            utc_now(),
-                        ),
-                    )
+                        break
+                    try:
+                        cursor = connection.execute(
+                            """
+                            INSERT INTO dataset_samples(
+                                sample_id_blob, sample_id_key, content_fingerprint, chunk_id,
+                                row_index, status, created_at
+                            )
+                            VALUES(?, ?, ?, ?, ?, 'pending', ?)
+                            """,
+                            (
+                                sample_blob,
+                                sample_id_key,
+                                fingerprint,
+                                chunk_id,
+                                row_index,
+                                utc_now(),
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        existing = _find_committed_sample_by_id(connection, sample_id_key)
+                        if (
+                            existing is not None
+                            and str(existing["content_fingerprint"]) == fingerprint
+                        ):
+                            skipped_rows += 1
+                            continue
+                        conflict_rows += 1
+                        conflict_error = ValueError(
+                            "conflicting sample_id with different input/output content"
+                        )
+                        break
                     sample_keys.append(int(cursor.lastrowid))
 
-                np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
-                connection.execute(
-                    "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
-                    (chunk_id,),
-                )
-                connection.execute(
-                    "UPDATE dataset_chunks SET status = 'committed', committed_at = ? WHERE id = ?",
-                    (utc_now(), chunk_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE dataset_ingestions
-                    SET status = 'committed',
-                        committed_rows = ?,
-                        skipped_rows = ?,
-                        conflict_rows = ?,
-                        finished_at = ?
-                    WHERE id = ?
-                    """,
-                    (len(new_rows), skipped_rows, conflict_rows, utc_now(), ingestion_id),
-                )
+                if conflict_error is not None:
+                    connection.execute(
+                        "DELETE FROM dataset_samples WHERE chunk_id = ?",
+                        (chunk_id,),
+                    )
+                    connection.execute("DELETE FROM dataset_chunks WHERE id = ?", (chunk_id,))
+                    connection.execute(
+                        """
+                        UPDATE dataset_ingestions
+                        SET status = 'failed',
+                            skipped_rows = ?,
+                            conflict_rows = ?,
+                            finished_at = ?,
+                            error = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            skipped_rows,
+                            conflict_rows,
+                            utc_now(),
+                            str(conflict_error),
+                            ingestion_id,
+                        ),
+                    )
+                    remove_uncommitted_chunk = True
+                elif not sample_keys:
+                    connection.execute("DELETE FROM dataset_chunks WHERE id = ?", (chunk_id,))
+                    connection.execute(
+                        """
+                        UPDATE dataset_ingestions
+                        SET status = 'committed',
+                            committed_rows = 0,
+                            skipped_rows = ?,
+                            conflict_rows = ?,
+                            finished_at = ?
+                        WHERE id = ?
+                        """,
+                        (skipped_rows, conflict_rows, utc_now(), ingestion_id),
+                    )
+                    remove_uncommitted_chunk = True
+                else:
+                    committed_rows = len(sample_keys)
+                    np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
+                    connection.execute(
+                        "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
+                        (chunk_id,),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE dataset_chunks
+                        SET row_count = ?, status = 'committed', committed_at = ?
+                        WHERE id = ?
+                        """,
+                        (committed_rows, utc_now(), chunk_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE dataset_ingestions
+                        SET status = 'committed',
+                            committed_rows = ?,
+                            skipped_rows = ?,
+                            conflict_rows = ?,
+                            finished_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            committed_rows,
+                            skipped_rows,
+                            conflict_rows,
+                            utc_now(),
+                            ingestion_id,
+                        ),
+                    )
         except Exception as exc:
             self._mark_dataset_ingestion_failed(ingestion_id, str(exc))
             self._remove_tree_best_effort(chunk_dir)
             raise
 
+        if remove_uncommitted_chunk:
+            self._remove_tree_best_effort(chunk_dir)
+        if conflict_error is not None:
+            raise conflict_error
+
         return {
-            "committed_rows": len(new_rows),
+            "committed_rows": committed_rows,
             "skipped_rows": skipped_rows,
             "conflict_rows": conflict_rows,
         }
