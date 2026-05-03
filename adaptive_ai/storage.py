@@ -19,6 +19,9 @@ from .dataset import DatasetBatch, SampleBatch
 from .math import architecture_from_matrices
 
 
+PreparedDatasetRow = tuple[bytes, str, str, np.ndarray, np.ndarray]
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -120,6 +123,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS dataset_samples (
                     key INTEGER PRIMARY KEY AUTOINCREMENT,
                     sample_id_blob BLOB NOT NULL UNIQUE,
+                    sample_id_key TEXT NOT NULL,
                     content_fingerprint TEXT NOT NULL,
                     chunk_id TEXT NOT NULL,
                     row_index INTEGER NOT NULL,
@@ -152,6 +156,41 @@ class Storage:
                 );
                 """
             )
+            self._ensure_dataset_sample_id_key(connection)
+
+    def _ensure_dataset_sample_id_key(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(dataset_samples)").fetchall()
+        }
+        if "sample_id_key" not in columns:
+            connection.execute("ALTER TABLE dataset_samples ADD COLUMN sample_id_key TEXT")
+
+        rows = connection.execute(
+            """
+            SELECT key, sample_id_blob
+            FROM dataset_samples
+            WHERE sample_id_key IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            sample_blob = bytes(row["sample_id_blob"])
+            sample_id = _sample_id_from_blob(sample_blob)
+            connection.execute(
+                """
+                UPDATE dataset_samples
+                SET sample_id_key = ?
+                WHERE key = ?
+                """,
+                (_sample_id_key(sample_id, sample_blob), int(row["key"])),
+            )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS dataset_samples_sample_id_key_idx
+            ON dataset_samples(sample_id_key)
+            """
+        )
 
     def mark_interrupted_jobs(self) -> None:
         with self._lock, self._connect() as connection:
@@ -301,10 +340,10 @@ class Storage:
 
     def _append_prepared_dataset(
         self,
-        rows: list[tuple[bytes, str, np.ndarray, np.ndarray]],
+        rows: list[PreparedDatasetRow],
     ) -> dict[str, int]:
         ingestion_id = str(uuid.uuid4())
-        new_rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
+        new_rows: list[PreparedDatasetRow] = []
         skipped_rows = 0
         conflict_rows = 0
         conflict_error: ValueError | None = None
@@ -317,8 +356,8 @@ class Storage:
                 """,
                 (ingestion_id, utc_now()),
             )
-            for sample_blob, fingerprint, input_row, output_row in rows:
-                existing = _find_committed_sample_by_id(connection, sample_blob)
+            for sample_blob, sample_id_key, fingerprint, input_row, output_row in rows:
+                existing = _find_committed_sample_by_id(connection, sample_id_key)
                 if existing is not None:
                     if str(existing["content_fingerprint"]) == fingerprint:
                         skipped_rows += 1
@@ -341,7 +380,9 @@ class Storage:
                         "conflicting sample_id with different input/output content"
                     )
                     break
-                new_rows.append((sample_blob, fingerprint, input_row, output_row))
+                new_rows.append(
+                    (sample_blob, sample_id_key, fingerprint, input_row, output_row)
+                )
 
         if conflict_error is not None:
             raise conflict_error
@@ -369,8 +410,8 @@ class Storage:
             input_path = chunk_dir / "inputs.npy"
             output_path = chunk_dir / "outputs.npy"
             sample_keys_path = chunk_dir / "sample_keys.npy"
-            chunk_inputs = np.asarray([row[2] for row in new_rows], dtype=np.float64)
-            chunk_outputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
+            chunk_inputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
+            chunk_outputs = np.asarray([row[4] for row in new_rows], dtype=np.float64)
             np.save(input_path, chunk_inputs)
             np.save(output_path, chunk_outputs)
 
@@ -393,16 +434,29 @@ class Storage:
                         utc_now(),
                     ),
                 )
-                for row_index, (sample_blob, fingerprint, _, _) in enumerate(new_rows):
+                for row_index, (
+                    sample_blob,
+                    sample_id_key,
+                    fingerprint,
+                    _,
+                    _,
+                ) in enumerate(new_rows):
                     cursor = connection.execute(
                         """
                         INSERT INTO dataset_samples(
-                            sample_id_blob, content_fingerprint, chunk_id,
+                            sample_id_blob, sample_id_key, content_fingerprint, chunk_id,
                             row_index, status, created_at
                         )
-                        VALUES(?, ?, ?, ?, 'pending', ?)
+                        VALUES(?, ?, ?, ?, ?, 'pending', ?)
                         """,
-                        (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                        (
+                            sample_blob,
+                            sample_id_key,
+                            fingerprint,
+                            chunk_id,
+                            row_index,
+                            utc_now(),
+                        ),
                     )
                     sample_keys.append(int(cursor.lastrowid))
 
@@ -440,7 +494,7 @@ class Storage:
 
     def _replace_prepared_dataset(
         self,
-        rows: list[tuple[bytes, str, np.ndarray, np.ndarray]],
+        rows: list[PreparedDatasetRow],
     ) -> dict[str, int]:
         ingestion_id = str(uuid.uuid4())
         old_chunk_dirs: list[Path] = []
@@ -475,8 +529,8 @@ class Storage:
 
         try:
             chunk_dir.mkdir(parents=True, exist_ok=False)
-            chunk_inputs = np.asarray([row[2] for row in rows], dtype=np.float64)
-            chunk_outputs = np.asarray([row[3] for row in rows], dtype=np.float64)
+            chunk_inputs = np.asarray([row[3] for row in rows], dtype=np.float64)
+            chunk_outputs = np.asarray([row[4] for row in rows], dtype=np.float64)
             np.save(input_path, chunk_inputs)
             np.save(output_path, chunk_outputs)
 
@@ -512,16 +566,29 @@ class Storage:
                         utc_now(),
                     ),
                 )
-                for row_index, (sample_blob, fingerprint, _, _) in enumerate(rows):
+                for row_index, (
+                    sample_blob,
+                    sample_id_key,
+                    fingerprint,
+                    _,
+                    _,
+                ) in enumerate(rows):
                     cursor = connection.execute(
                         """
                         INSERT INTO dataset_samples(
-                            sample_id_blob, content_fingerprint, chunk_id,
+                            sample_id_blob, sample_id_key, content_fingerprint, chunk_id,
                             row_index, status, created_at
                         )
-                        VALUES(?, ?, ?, ?, 'pending', ?)
+                        VALUES(?, ?, ?, ?, ?, 'pending', ?)
                         """,
-                        (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                        (
+                            sample_blob,
+                            sample_id_key,
+                            fingerprint,
+                            chunk_id,
+                            row_index,
+                            utc_now(),
+                        ),
                     )
                     sample_keys.append(int(cursor.lastrowid))
 
@@ -951,7 +1018,7 @@ def _prepare_dataset_rows(
     outputs: np.ndarray,
     *,
     sample_ids: Iterable[object] | None,
-) -> list[tuple[bytes, str, np.ndarray, np.ndarray]]:
+) -> list[PreparedDatasetRow]:
     if inputs.shape[0] != outputs.shape[0]:
         raise ValueError("inputs and outputs must contain the same number of samples")
 
@@ -963,83 +1030,37 @@ def _prepare_dataset_rows(
     if len(ids) != inputs.shape[0]:
         raise ValueError("sample_ids must contain one id per sample")
 
-    rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
-    seen_blobs: set[bytes] = set()
-    seen_value_ids: list[object] = []
+    rows: list[PreparedDatasetRow] = []
+    seen_keys: set[str] = set()
     for sample_id, input_row, output_row in zip(ids, inputs, outputs, strict=True):
         sample_blob = _sample_id_to_blob(sample_id)
-        needs_value_lookup = _sample_id_needs_value_lookup(sample_id)
-        if sample_blob in seen_blobs or (
-            needs_value_lookup
-            and any(
-                _sample_ids_equal(existing_id, sample_id)
-                for existing_id in seen_value_ids
-            )
-        ):
+        sample_id_key = _sample_id_key(sample_id, sample_blob)
+        if sample_id_key in seen_keys:
             raise ValueError("duplicate sample_ids are not allowed in one dataset write")
-        seen_blobs.add(sample_blob)
-        if needs_value_lookup:
-            seen_value_ids.append(sample_id)
+        seen_keys.add(sample_id_key)
         rows.append(
-            (sample_blob, _fingerprint_row(input_row, output_row), input_row, output_row)
+            (
+                sample_blob,
+                sample_id_key,
+                _fingerprint_row(input_row, output_row),
+                input_row,
+                output_row,
+            )
         )
     return rows
 
 
 def _find_committed_sample_by_id(
-    connection: sqlite3.Connection, sample_blob: bytes
+    connection: sqlite3.Connection, sample_id_key: str
 ) -> sqlite3.Row | None:
-    existing = connection.execute(
+    return connection.execute(
         """
-        SELECT sample_id_blob, content_fingerprint
+        SELECT content_fingerprint
         FROM dataset_samples
-        WHERE sample_id_blob = ? AND status = 'committed'
+        WHERE sample_id_key = ? AND status = 'committed'
         """,
-        (sample_blob,),
+        (sample_id_key,),
     ).fetchone()
-    if existing is not None:
-        return existing
-
-    sample_id = _sample_id_from_blob(sample_blob)
-    if not _sample_id_needs_value_lookup(sample_id):
-        return None
-
-    rows = connection.execute(
-        """
-        SELECT sample_id_blob, content_fingerprint
-        FROM dataset_samples
-        WHERE status = 'committed'
-        """
-    ).fetchall()
-    for row in rows:
-        if _sample_ids_equal(
-            _sample_id_from_blob(bytes(row["sample_id_blob"])), sample_id
-        ):
-            return row
-    return None
-
-
-def _sample_id_needs_value_lookup(sample_id: object) -> bool:
-    return isinstance(sample_id, Mapping)
-
-
-def _sample_ids_equal(left: object, right: object) -> bool:
-    if left is right:
-        return True
-    if type(left) is not type(right):
-        return False
-    try:
-        result = left == right
-    except Exception:
-        return False
-    if result is NotImplemented:
-        return False
-    if isinstance(result, (bool, np.bool_)):
-        return bool(result)
-    try:
-        return bool(result)
-    except (TypeError, ValueError):
-        return False
 
 
 def _sample_id_to_blob(sample_id: object) -> bytes:
@@ -1051,6 +1072,54 @@ def _sample_id_to_blob(sample_id: object) -> bytes:
 
 def _sample_id_from_blob(blob: bytes) -> Any:
     return pickle.loads(blob)
+
+
+def _sample_id_key(sample_id: object, sample_blob: bytes | None = None) -> str:
+    sample_blob = sample_blob if sample_blob is not None else _sample_id_to_blob(sample_id)
+    try:
+        canonical_value = _canonical_json_sample_id(sample_id)
+    except TypeError:
+        encoded = b"pickle-v1\0" + sample_blob
+    else:
+        canonical_json = json.dumps(
+            canonical_value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        encoded = b"json-v1\0" + canonical_json.encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_json_sample_id(sample_id: object) -> object:
+    if sample_id is None:
+        return ["none"]
+    if isinstance(sample_id, bool):
+        return ["bool", sample_id]
+    if isinstance(sample_id, int) and not isinstance(sample_id, bool):
+        return ["int", str(sample_id)]
+    if isinstance(sample_id, float):
+        return ["float", sample_id.hex()]
+    if isinstance(sample_id, str):
+        return ["str", sample_id]
+    if isinstance(sample_id, list):
+        return ["list", [_canonical_json_sample_id(value) for value in sample_id]]
+    if isinstance(sample_id, tuple):
+        return ["tuple", [_canonical_json_sample_id(value) for value in sample_id]]
+    if isinstance(sample_id, Mapping):
+        items = []
+        for key, value in sample_id.items():
+            canonical_key = _canonical_json_sample_id(key)
+            canonical_value = _canonical_json_sample_id(value)
+            sort_key = json.dumps(
+                canonical_key,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            items.append((sort_key, [canonical_key, canonical_value]))
+        return ["mapping", [item for _, item in sorted(items, key=lambda item: item[0])]]
+    raise TypeError("sample_id is not JSON-like")
 
 
 def _generated_sample_id() -> str:

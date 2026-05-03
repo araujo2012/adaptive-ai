@@ -83,6 +83,49 @@ def test_equal_opaque_sample_ids_are_idempotent_across_pickle_order(tmp_path):
     assert len(chunk_dirs) == 1
 
 
+def test_sample_id_lookup_uses_indexed_canonical_key(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=[{"left": 1, "right": 2}])
+
+    db_path = tmp_path / ".adaptive_ai" / "adaptive_ai.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        sample_id_key = connection.execute(
+            """
+            SELECT sample_id_key
+            FROM dataset_samples
+            WHERE status = 'committed'
+            """
+        ).fetchone()[0]
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT content_fingerprint
+            FROM dataset_samples
+            WHERE sample_id_key = ? AND status = 'committed'
+            """,
+            (sample_id_key,),
+        ).fetchall()
+
+    details = [str(row[3]).upper() for row in plan]
+    assert not any("SCAN DATASET_SAMPLES" in detail for detail in details)
+    assert any("INDEX" in detail for detail in details)
+
+
+def test_duplicate_mapping_sample_ids_use_canonical_batch_key(tmp_path, monkeypatch):
+    def fail_value_comparison(*args):
+        raise AssertionError("batch duplicate detection should not compare mappings")
+
+    monkeypatch.setattr(storage_module, "_sample_ids_equal", fail_value_comparison, raising=False)
+    ai = AdaptiveAI(path=tmp_path)
+
+    with pytest.raises(ValueError, match="duplicate sample_ids"):
+        ai.set_input_output(
+            [[0], [1]],
+            [[0], [1]],
+            sample_ids=[{"left": 1, "right": 2}, {"right": 2, "left": 1}],
+        )
+
+
 def test_dataset_view_does_not_support_full_array_indexing(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
