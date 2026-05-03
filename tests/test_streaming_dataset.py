@@ -52,6 +52,36 @@ def _wait_for_path(path, process, stdout, stderr, timeout=10):
         time.sleep(0.01)
 
 
+def _guard_dataset_sample_in_bind_count(ai, monkeypatch, *, max_binds):
+    original_connect = ai._storage._connect
+    bind_counts = []
+
+    class GuardedConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=(), *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if "FROM DATASET_SAMPLES" in normalized and " IN (" in normalized:
+                bind_count = len(parameters)
+                bind_counts.append(bind_count)
+                if bind_count > max_binds:
+                    raise sqlite3.OperationalError("too many SQL variables")
+            return self._connection.execute(sql, parameters, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    @contextmanager
+    def guarded_connect():
+        with original_connect() as connection:
+            yield GuardedConnection(connection)
+
+    monkeypatch.setattr(storage_module, "MAX_SQL_BIND_PARAMETERS", max_binds, raising=False)
+    monkeypatch.setattr(ai._storage, "_connect", guarded_connect)
+    return bind_counts
+
+
 def _run_concurrent_appends(tmp_path, monkeypatch, jobs):
     start_barrier = threading.Barrier(len(jobs))
     write_barrier = threading.Barrier(len(jobs))
@@ -157,6 +187,90 @@ def test_get_samples_returns_requested_sample_ids_in_requested_order(tmp_path):
     assert samples.sample_ids == ["c", "a"]
     np.testing.assert_allclose(samples.inputs, [[2, 2], [0, 0]])
     np.testing.assert_allclose(samples.outputs, [[1], [0]])
+
+
+def test_get_samples_preserves_duplicate_requested_ids(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0, 0], [1, 1]],
+        [[0], [1]],
+        sample_ids=["a", "b"],
+    )
+
+    samples = ai.get_samples(["b", "a", "b"])
+
+    assert samples.sample_ids == ["b", "a", "b"]
+    np.testing.assert_allclose(samples.inputs, [[1, 1], [0, 0], [1, 1]])
+    np.testing.assert_allclose(samples.outputs, [[1], [0], [1]])
+
+
+def test_empty_get_samples_and_empty_key_batches_return_empty_batches(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0, 0, 0]],
+        [[0, 0]],
+        sample_ids=["seed"],
+    )
+
+    samples = ai.get_samples([])
+
+    assert samples.sample_keys.tolist() == []
+    assert samples.sample_ids == []
+    assert samples.inputs.shape == (0, 3)
+    assert samples.outputs.shape == (0, 2)
+    assert list(
+        ai._storage.iter_key_batches(np.asarray([], dtype=np.uint64), batch_size=2)
+    ) == []
+
+
+def test_large_get_samples_lookup_is_paged_below_sqlite_bind_limit(
+    tmp_path, monkeypatch
+):
+    ai = AdaptiveAI(path=tmp_path)
+    sample_ids = [f"id-{index}" for index in range(12)]
+    ai.set_input_output(
+        [[index, index + 100] for index in range(12)],
+        [[index % 2] for index in range(12)],
+        sample_ids=sample_ids,
+    )
+    bind_counts = _guard_dataset_sample_in_bind_count(ai, monkeypatch, max_binds=3)
+
+    samples = ai.get_samples(sample_ids)
+
+    assert samples.sample_ids == sample_ids
+    np.testing.assert_allclose(
+        samples.inputs, [[index, index + 100] for index in range(12)]
+    )
+    np.testing.assert_allclose(samples.outputs, [[index % 2] for index in range(12)])
+    assert bind_counts
+    assert max(bind_counts) <= 3
+
+
+def test_large_load_samples_by_keys_is_paged_below_sqlite_bind_limit(
+    tmp_path, monkeypatch
+):
+    ai = AdaptiveAI(path=tmp_path)
+    sample_ids = [f"id-{index}" for index in range(12)]
+    ai.set_input_output(
+        [[index, index + 100] for index in range(12)],
+        [[index % 2] for index in range(12)],
+        sample_ids=sample_ids,
+    )
+    all_keys = np.concatenate(
+        [batch.sample_keys for batch in ai.get_dataset().iter_batches(batch_size=4)]
+    )
+    bind_counts = _guard_dataset_sample_in_bind_count(ai, monkeypatch, max_binds=3)
+
+    samples = ai._storage.load_samples_by_keys(all_keys)
+
+    assert samples.sample_keys.tolist() == all_keys.tolist()
+    assert samples.sample_ids == sample_ids
+    np.testing.assert_allclose(
+        samples.inputs, [[index, index + 100] for index in range(12)]
+    )
+    np.testing.assert_allclose(samples.outputs, [[index % 2] for index in range(12)])
+    assert bind_counts
+    assert max(bind_counts) <= 3
 
 
 def test_missing_sample_id_fails_clearly(tmp_path):

@@ -22,6 +22,7 @@ from .math import architecture_from_matrices
 
 
 PreparedDatasetRow = tuple[bytes, str, str, np.ndarray, np.ndarray]
+MAX_SQL_BIND_PARAMETERS = 500
 
 
 def utc_now() -> str:
@@ -1092,16 +1093,20 @@ class Storage:
             return self.load_samples_by_keys(np.asarray([], dtype=np.uint64))
 
         unique_id_keys = list(dict.fromkeys(requested_id_keys))
-        bind_marks = ",".join("?" for _ in unique_id_keys)
+        rows = []
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT key, sample_id_key
-                FROM dataset_samples
-                WHERE status = 'committed' AND sample_id_key IN ({bind_marks})
-                """,
-                unique_id_keys,
-            ).fetchall()
+            for chunk in _chunks(unique_id_keys, MAX_SQL_BIND_PARAMETERS):
+                bind_marks = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT key, sample_id_key
+                        FROM dataset_samples
+                        WHERE status = 'committed' AND sample_id_key IN ({bind_marks})
+                        """,
+                        chunk,
+                    ).fetchall()
+                )
 
         key_by_sample_id_key = {
             str(row["sample_id_key"]): int(row["key"]) for row in rows
@@ -1147,16 +1152,21 @@ class Storage:
                 outputs=np.empty((0, output_size), dtype=np.float64),
             )
 
-        bind_marks = ",".join("?" for _ in keys)
+        unique_keys = list(dict.fromkeys(int(key) for key in keys))
+        rows = []
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT key, sample_id_blob, chunk_id, row_index
-                FROM dataset_samples
-                WHERE status = 'committed' AND key IN ({bind_marks})
-                """,
-                [int(key) for key in keys],
-            ).fetchall()
+            for chunk in _chunks(unique_keys, MAX_SQL_BIND_PARAMETERS):
+                bind_marks = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT key, sample_id_blob, chunk_id, row_index
+                        FROM dataset_samples
+                        WHERE status = 'committed' AND key IN ({bind_marks})
+                        """,
+                        chunk,
+                    ).fetchall()
+                )
 
         by_key = {int(row["key"]): row for row in rows}
         missing = [int(key) for key in keys if int(key) not in by_key]
@@ -1418,6 +1428,13 @@ class Storage:
                 (job_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+def _chunks(values: list[Any], size: int) -> Iterator[list[Any]]:
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
 
 
 def _optional_float(value: object) -> float | None:
