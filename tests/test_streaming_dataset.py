@@ -144,6 +144,53 @@ def test_sample_ids_are_exposed_and_duplicate_identical_rows_are_idempotent(tmp_
     assert len(chunk_dirs) == 1
 
 
+def test_get_samples_returns_requested_sample_ids_in_requested_order(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0, 0], [1, 1], [2, 2]],
+        [[0], [1], [1]],
+        sample_ids=["a", "b", "c"],
+    )
+
+    samples = ai.get_samples(["c", "a"])
+
+    assert samples.sample_ids == ["c", "a"]
+    np.testing.assert_allclose(samples.inputs, [[2, 2], [0, 0]])
+    np.testing.assert_allclose(samples.outputs, [[1], [0]])
+
+
+def test_missing_sample_id_fails_clearly(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["a"])
+
+    with pytest.raises(ValueError, match="sample_ids were not found"):
+        ai.get_samples(["missing"])
+
+
+def test_iter_key_batches_yields_requested_keys_in_batch_size(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0], [1], [2], [3], [4]],
+        [[0], [0], [1], [1], [1]],
+        sample_ids=[f"id-{index}" for index in range(5)],
+    )
+    all_keys = np.concatenate(
+        [batch.sample_keys for batch in ai.get_dataset().iter_batches(batch_size=2)]
+    )
+    selected_keys = all_keys[[4, 1, 3]]
+
+    batches = list(ai._storage.iter_key_batches(selected_keys, batch_size=2))
+
+    assert [batch.sample_keys.tolist() for batch in batches] == [
+        selected_keys[:2].tolist(),
+        selected_keys[2:].tolist(),
+    ]
+    assert [batch.sample_ids for batch in batches] == [["id-4", "id-1"], ["id-3"]]
+    np.testing.assert_allclose(
+        np.vstack([batch.inputs for batch in batches]), [[4], [1], [3]]
+    )
+
+
 def test_duplicate_sample_id_with_different_content_fails(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0]], [[0]], sample_ids=["same-id"])

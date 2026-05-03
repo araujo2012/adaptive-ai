@@ -1085,6 +1085,52 @@ class Storage:
                 outputs=batch.outputs,
             )
 
+    def load_samples_by_ids(self, sample_ids: Iterable[object]) -> SampleBatch:
+        ids = list(sample_ids)
+        requested_id_keys = [_sample_id_key(sample_id) for sample_id in ids]
+        if not requested_id_keys:
+            return self.load_samples_by_keys(np.asarray([], dtype=np.uint64))
+
+        unique_id_keys = list(dict.fromkeys(requested_id_keys))
+        bind_marks = ",".join("?" for _ in unique_id_keys)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT key, sample_id_key
+                FROM dataset_samples
+                WHERE status = 'committed' AND sample_id_key IN ({bind_marks})
+                """,
+                unique_id_keys,
+            ).fetchall()
+
+        key_by_sample_id_key = {
+            str(row["sample_id_key"]): int(row["key"]) for row in rows
+        }
+        missing = [
+            sample_id
+            for sample_id, sample_id_key in zip(ids, requested_id_keys, strict=True)
+            if sample_id_key not in key_by_sample_id_key
+        ]
+        if missing:
+            raise ValueError(f"sample_ids were not found: {missing[:3]}")
+
+        sample_keys = np.asarray(
+            [key_by_sample_id_key[sample_id_key] for sample_id_key in requested_id_keys],
+            dtype=np.uint64,
+        )
+        return self.load_samples_by_keys(sample_keys)
+
+    def iter_key_batches(
+        self, sample_keys: np.ndarray, *, batch_size: int
+    ) -> Iterator[SampleBatch]:
+        keys = np.asarray(sample_keys, dtype=np.uint64)
+        if keys.ndim != 1:
+            raise ValueError("sample_keys must be a 1D array")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        for start in range(0, keys.shape[0], batch_size):
+            yield self.load_samples_by_keys(keys[start : start + batch_size])
+
     def load_samples_by_keys(self, sample_keys: np.ndarray) -> SampleBatch:
         keys = np.asarray(sample_keys, dtype=np.uint64)
         if keys.ndim != 1:
