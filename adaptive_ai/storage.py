@@ -166,6 +166,14 @@ class Storage:
 
     def cleanup_pending_dataset_chunks(self) -> None:
         with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE dataset_ingestions
+                SET status = 'failed', finished_at = ?, error = 'process interrupted'
+                WHERE status = 'running'
+                """,
+                (utc_now(),),
+            )
             rows = connection.execute(
                 """
                 SELECT id, input_path, output_path, sample_keys_path
@@ -173,13 +181,31 @@ class Storage:
                 WHERE status != 'committed'
                 """
             ).fetchall()
+            committed_rows = connection.execute(
+                """
+                SELECT id
+                FROM dataset_chunks
+                WHERE status = 'committed'
+                """
+            ).fetchall()
+            noncommitted_chunk_ids = [str(row["id"]) for row in rows]
+            if noncommitted_chunk_ids:
+                bind_marks = ",".join("?" for _ in noncommitted_chunk_ids)
+                connection.execute(
+                    f"DELETE FROM dataset_samples WHERE chunk_id IN ({bind_marks})",
+                    noncommitted_chunk_ids,
+                )
             connection.execute("DELETE FROM dataset_samples WHERE status != 'committed'")
             connection.execute("DELETE FROM dataset_chunks WHERE status != 'committed'")
 
+        committed_chunk_ids = {str(row["id"]) for row in committed_rows}
         for row in rows:
             chunk_dir = Path(str(row["input_path"])).parent
-            if chunk_dir.exists():
-                shutil.rmtree(chunk_dir)
+            self._remove_tree_best_effort(chunk_dir)
+        if self.chunks_path.exists():
+            for child in self.chunks_path.iterdir():
+                if child.is_dir() and child.name not in committed_chunk_ids:
+                    self._remove_tree_best_effort(child)
 
     def get_dimensions(self) -> tuple[int, int] | None:
         input_size = self.get_setting("input_size")
@@ -260,8 +286,7 @@ class Storage:
         sample_ids: Iterable[object] | None = None,
     ) -> dict[str, int]:
         rows = _prepare_dataset_rows(inputs, outputs, sample_ids=sample_ids)
-        self.clear_dataset()
-        return self._append_prepared_dataset(rows)
+        return self._replace_prepared_dataset(rows)
 
     def append_dataset(
         self,
@@ -410,17 +435,8 @@ class Storage:
                     (len(new_rows), skipped_rows, conflict_rows, utc_now(), ingestion_id),
                 )
         except Exception as exc:
-            if chunk_dir.exists():
-                shutil.rmtree(chunk_dir)
-            with self._lock, self._connect() as connection:
-                connection.execute(
-                    """
-                    UPDATE dataset_ingestions
-                    SET status = 'failed', finished_at = ?, error = ?
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (utc_now(), str(exc), ingestion_id),
-                )
+            self._mark_dataset_ingestion_failed(ingestion_id, str(exc))
+            self._remove_tree_best_effort(chunk_dir)
             raise
 
         return {
@@ -428,6 +444,188 @@ class Storage:
             "skipped_rows": skipped_rows,
             "conflict_rows": conflict_rows,
         }
+
+    def _replace_prepared_dataset(
+        self,
+        rows: list[tuple[bytes, str, np.ndarray, np.ndarray]],
+    ) -> dict[str, int]:
+        ingestion_id = str(uuid.uuid4())
+        old_chunk_dirs: list[Path] = []
+        old_split_paths: list[Path] = []
+
+        if not rows:
+            with self._lock, self._connect() as connection:
+                old_chunk_dirs = self._dataset_chunk_dirs(connection)
+                old_split_paths = self._training_split_paths(connection)
+                connection.execute("DELETE FROM training_splits")
+                connection.execute("DELETE FROM dataset_samples")
+                connection.execute("DELETE FROM dataset_chunks")
+                connection.execute("DELETE FROM dataset_ingestions")
+                connection.execute(
+                    """
+                    INSERT INTO dataset_ingestions(
+                        id, status, committed_rows, skipped_rows, conflict_rows,
+                        started_at, finished_at
+                    )
+                    VALUES(?, 'committed', 0, 0, 0, ?, ?)
+                    """,
+                    (ingestion_id, utc_now(), utc_now()),
+                )
+            self._cleanup_replaced_dataset_files(old_chunk_dirs, old_split_paths)
+            return {"committed_rows": 0, "skipped_rows": 0, "conflict_rows": 0}
+
+        chunk_id = str(uuid.uuid4())
+        chunk_dir = self.chunks_path / chunk_id
+        input_path = chunk_dir / "inputs.npy"
+        output_path = chunk_dir / "outputs.npy"
+        sample_keys_path = chunk_dir / "sample_keys.npy"
+
+        try:
+            chunk_dir.mkdir(parents=True, exist_ok=False)
+            chunk_inputs = np.asarray([row[2] for row in rows], dtype=np.float64)
+            chunk_outputs = np.asarray([row[3] for row in rows], dtype=np.float64)
+            np.save(input_path, chunk_inputs)
+            np.save(output_path, chunk_outputs)
+
+            sample_keys: list[int] = []
+            with self._lock, self._connect() as connection:
+                old_chunk_dirs = self._dataset_chunk_dirs(connection)
+                old_split_paths = self._training_split_paths(connection)
+                connection.execute("DELETE FROM training_splits")
+                connection.execute("DELETE FROM dataset_samples")
+                connection.execute("DELETE FROM dataset_chunks")
+                connection.execute("DELETE FROM dataset_ingestions")
+                connection.execute(
+                    """
+                    INSERT INTO dataset_ingestions(id, status, started_at)
+                    VALUES(?, 'running', ?)
+                    """,
+                    (ingestion_id, utc_now()),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dataset_chunks(
+                        id, input_path, output_path, sample_keys_path,
+                        row_count, status, created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        chunk_id,
+                        str(input_path),
+                        str(output_path),
+                        str(sample_keys_path),
+                        len(rows),
+                        utc_now(),
+                    ),
+                )
+                for row_index, (sample_blob, fingerprint, _, _) in enumerate(rows):
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO dataset_samples(
+                            sample_id_blob, content_fingerprint, chunk_id,
+                            row_index, status, created_at
+                        )
+                        VALUES(?, ?, ?, ?, 'pending', ?)
+                        """,
+                        (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                    )
+                    sample_keys.append(int(cursor.lastrowid))
+
+                np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
+                connection.execute(
+                    "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
+                    (chunk_id,),
+                )
+                connection.execute(
+                    "UPDATE dataset_chunks SET status = 'committed', committed_at = ? WHERE id = ?",
+                    (utc_now(), chunk_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'committed',
+                        committed_rows = ?,
+                        skipped_rows = 0,
+                        conflict_rows = 0,
+                        finished_at = ?
+                    WHERE id = ?
+                    """,
+                    (len(rows), utc_now(), ingestion_id),
+                )
+        except Exception:
+            self._remove_tree_best_effort(chunk_dir)
+            raise
+
+        self._cleanup_replaced_dataset_files(
+            old_chunk_dirs,
+            old_split_paths,
+            preserve_chunk_dir=chunk_dir,
+        )
+        return {
+            "committed_rows": len(rows),
+            "skipped_rows": 0,
+            "conflict_rows": 0,
+        }
+
+    def _dataset_chunk_dirs(self, connection: sqlite3.Connection) -> list[Path]:
+        rows = connection.execute("SELECT input_path FROM dataset_chunks").fetchall()
+        return [Path(str(row["input_path"])).parent for row in rows]
+
+    def _training_split_paths(self, connection: sqlite3.Connection) -> list[Path]:
+        rows = connection.execute(
+            "SELECT train_path, validation_path FROM training_splits"
+        ).fetchall()
+        paths: list[Path] = []
+        for row in rows:
+            paths.append(Path(str(row["train_path"])))
+            paths.append(Path(str(row["validation_path"])))
+        return paths
+
+    def _cleanup_replaced_dataset_files(
+        self,
+        old_chunk_dirs: list[Path],
+        old_split_paths: list[Path],
+        *,
+        preserve_chunk_dir: Path | None = None,
+    ) -> None:
+        legacy_file = self.dataset_file()
+        if legacy_file.exists():
+            self._unlink_best_effort(legacy_file)
+        for path in old_split_paths:
+            self._unlink_best_effort(path)
+        for chunk_dir in old_chunk_dirs:
+            if preserve_chunk_dir is not None and chunk_dir == preserve_chunk_dir:
+                continue
+            self._remove_tree_best_effort(chunk_dir)
+
+    def _mark_dataset_ingestion_failed(self, ingestion_id: str, error: str) -> None:
+        try:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'failed', finished_at = ?, error = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (utc_now(), error, ingestion_id),
+                )
+        except Exception:
+            pass
+
+    def _remove_tree_best_effort(self, path: Path) -> None:
+        try:
+            if path.exists():
+                shutil.rmtree(path)
+        except Exception:
+            pass
+
+    def _unlink_best_effort(self, path: Path) -> None:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
     def get_sample_count(self) -> int:
         with self._lock, self._connect() as connection:
