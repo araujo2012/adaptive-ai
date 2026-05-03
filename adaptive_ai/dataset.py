@@ -52,14 +52,3 @@ class DatasetView:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         yield from self._batch_iterator(batch_size)
-
-    def __getitem__(self, key: str) -> np.ndarray:
-        if key not in {"inputs", "outputs"}:
-            raise KeyError(key)
-
-        batches = list(self.iter_batches(batch_size=max(self.sample_count, 1)))
-        if batches:
-            return np.vstack([getattr(batch, key) for batch in batches])
-
-        width = self.input_size if key == "inputs" else self.output_size
-        return np.empty((0, width), dtype=np.float64)

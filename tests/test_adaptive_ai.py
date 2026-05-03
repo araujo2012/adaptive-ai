@@ -32,10 +32,16 @@ def test_set_and_put_input_output_persist_float64_dataset(tmp_path):
     ai.put_input_output([[1, 0]], [[1]])
 
     dataset = ai.get_dataset()
-    assert dataset["inputs"].dtype == np.float64
-    assert dataset["outputs"].dtype == np.float64
-    np.testing.assert_allclose(dataset["inputs"], [[0, 0], [1, 1], [1, 0]])
-    np.testing.assert_allclose(dataset["outputs"], [[0], [1], [1]])
+    assert dataset.sample_count == 3
+    assert dataset.input_size == 2
+    assert dataset.output_size == 1
+
+    batches = list(dataset.iter_batches(batch_size=10))
+    assert len(batches) == 1
+    assert batches[0].inputs.dtype == np.float64
+    assert batches[0].outputs.dtype == np.float64
+    np.testing.assert_allclose(batches[0].inputs, [[0, 0], [1, 1], [1, 0]])
+    np.testing.assert_allclose(batches[0].outputs, [[0], [1], [1]])
 
 
 def test_rejects_incompatible_dimensions_and_outputs_outside_sigmoid_range(tmp_path):

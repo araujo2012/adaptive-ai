@@ -37,6 +37,16 @@ def test_set_and_put_input_output_create_chunked_collection(tmp_path):
     )
 
 
+def test_dataset_view_does_not_support_full_array_indexing(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
+
+    dataset = ai.get_dataset()
+
+    with pytest.raises(TypeError):
+        dataset["inputs"]
+
+
 def test_legacy_dataset_npz_without_chunks_requires_explicit_migration(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai._storage.set_dimensions(2, 1)
