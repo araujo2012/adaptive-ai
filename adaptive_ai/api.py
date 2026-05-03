@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
+from .dataset import DatasetBatch, DatasetView, SampleBatch
 from .math import (
     as_2d_float64,
     evaluate_matrices,
@@ -38,22 +40,44 @@ class AdaptiveAI:
         self._controls: dict[str, _JobControl] = {}
         self._controls_lock = threading.RLock()
 
-    def set_input_output(self, inputs: object, outputs: object) -> None:
+    def set_input_output(
+        self,
+        inputs: object,
+        outputs: object,
+        *,
+        sample_ids: Sequence[object] | None = None,
+    ) -> None:
         input_array, output_array = self._prepare_dataset(inputs, outputs)
         self._ensure_or_set_dimensions(input_array.shape[1], output_array.shape[1])
-        self._storage.save_dataset(input_array, output_array)
+        self._storage.replace_dataset(input_array, output_array, sample_ids=sample_ids)
         self._storage.clear_models()
 
-    def put_input_output(self, inputs: object, outputs: object) -> None:
+    def put_input_output(
+        self,
+        inputs: object,
+        outputs: object,
+        *,
+        sample_ids: Sequence[object] | None = None,
+    ) -> None:
         input_array, output_array = self._prepare_dataset(inputs, outputs)
         self._require_dimensions(input_array.shape[1], output_array.shape[1])
-        dataset = self._storage.load_dataset()
-        combined_inputs = np.concatenate([dataset["inputs"], input_array], axis=0)
-        combined_outputs = np.concatenate([dataset["outputs"], output_array], axis=0)
-        self._storage.save_dataset(combined_inputs, combined_outputs)
+        self._storage.append_dataset(input_array, output_array, sample_ids=sample_ids)
 
-    def get_dataset(self) -> dict[str, np.ndarray]:
-        return self._storage.load_dataset()
+    def get_dataset(self) -> DatasetView:
+        dimensions = self._storage.get_dimensions()
+        if dimensions is None:
+            raise ValueError("dataset has not been set")
+        input_size, output_size = dimensions
+
+        def iter_batches(batch_size: int) -> Iterator[DatasetBatch]:
+            yield from self._storage.iter_dataset_batches(batch_size=batch_size)
+
+        return DatasetView(
+            sample_count=self._storage.get_sample_count(),
+            input_size=input_size,
+            output_size=output_size,
+            batch_iterator=iter_batches,
+        )
 
     def predict_with_matrices(self, inputs: object, matrices: Sequence[np.ndarray]) -> np.ndarray:
         input_array = as_2d_float64(inputs, name="inputs")

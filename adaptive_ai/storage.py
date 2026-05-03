@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+import hashlib
 import json
+import pickle
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -10,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from .dataset import DatasetBatch, SampleBatch
 from .math import architecture_from_matrices
 
 
@@ -22,15 +27,22 @@ class Storage:
         self.root_path = root_path
         self.base_path = root_path / ".adaptive_ai"
         self.arrays_path = self.base_path / "arrays"
+        self.dataset_path = self.arrays_path / "dataset"
+        self.chunks_path = self.dataset_path / "chunks"
+        self.job_splits_path = self.dataset_path / "job_splits"
         self.models_path = self.base_path / "models"
         self.db_path = self.base_path / "adaptive_ai.sqlite3"
         self._lock = threading.RLock()
 
         self.root_path.mkdir(parents=True, exist_ok=True)
         self.arrays_path.mkdir(parents=True, exist_ok=True)
+        self.dataset_path.mkdir(parents=True, exist_ok=True)
+        self.chunks_path.mkdir(parents=True, exist_ok=True)
+        self.job_splits_path.mkdir(parents=True, exist_ok=True)
         self.models_path.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self.mark_interrupted_jobs()
+        self.cleanup_pending_dataset_chunks()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -84,6 +96,51 @@ class Storage:
                     mse REAL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS dataset_chunks (
+                    id TEXT PRIMARY KEY,
+                    input_path TEXT NOT NULL,
+                    output_path TEXT NOT NULL,
+                    sample_keys_path TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    committed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS dataset_samples (
+                    key INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sample_id_blob BLOB NOT NULL UNIQUE,
+                    content_fingerprint TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(chunk_id) REFERENCES dataset_chunks(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS dataset_ingestions (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    committed_rows INTEGER NOT NULL DEFAULT 0,
+                    skipped_rows INTEGER NOT NULL DEFAULT 0,
+                    conflict_rows INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS training_splits (
+                    job_id TEXT PRIMARY KEY,
+                    seed INTEGER,
+                    train_ratio REAL NOT NULL,
+                    train_path TEXT NOT NULL,
+                    validation_path TEXT NOT NULL,
+                    train_count INTEGER NOT NULL,
+                    validation_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
                 """
             )
 
@@ -97,6 +154,23 @@ class Storage:
                 """,
                 (utc_now(),),
             )
+
+    def cleanup_pending_dataset_chunks(self) -> None:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, input_path, output_path, sample_keys_path
+                FROM dataset_chunks
+                WHERE status != 'committed'
+                """
+            ).fetchall()
+            connection.execute("DELETE FROM dataset_samples WHERE status != 'committed'")
+            connection.execute("DELETE FROM dataset_chunks WHERE status != 'committed'")
+
+        for row in rows:
+            chunk_dir = Path(str(row["input_path"])).parent
+            if chunk_dir.exists():
+                shutil.rmtree(chunk_dir)
 
     def get_dimensions(self) -> tuple[int, int] | None:
         input_size = self.get_setting("input_size")
@@ -129,9 +203,16 @@ class Storage:
         return self.arrays_path / "dataset.npz"
 
     def save_dataset(self, inputs: np.ndarray, outputs: np.ndarray) -> None:
-        np.savez_compressed(self.dataset_file(), inputs=inputs, outputs=outputs)
+        self.replace_dataset(inputs, outputs)
 
     def load_dataset(self) -> dict[str, np.ndarray]:
+        if self.get_sample_count() > 0:
+            batches = list(self.iter_dataset_batches(batch_size=1024))
+            return {
+                "inputs": np.vstack([batch.inputs for batch in batches]),
+                "outputs": np.vstack([batch.outputs for batch in batches]),
+            }
+
         path = self.dataset_file()
         if not path.exists():
             raise ValueError("dataset has not been set")
@@ -140,6 +221,278 @@ class Storage:
                 "inputs": data["inputs"].astype(np.float64, copy=False),
                 "outputs": data["outputs"].astype(np.float64, copy=False),
             }
+
+    def clear_dataset(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM training_splits")
+            connection.execute("DELETE FROM dataset_samples")
+            connection.execute("DELETE FROM dataset_chunks")
+            connection.execute("DELETE FROM dataset_ingestions")
+
+        legacy_file = self.dataset_file()
+        if legacy_file.exists():
+            legacy_file.unlink()
+        if self.dataset_path.exists():
+            shutil.rmtree(self.dataset_path)
+        self.dataset_path.mkdir(parents=True, exist_ok=True)
+        self.chunks_path.mkdir(parents=True, exist_ok=True)
+        self.job_splits_path.mkdir(parents=True, exist_ok=True)
+
+    def replace_dataset(
+        self,
+        inputs: np.ndarray,
+        outputs: np.ndarray,
+        *,
+        sample_ids: Iterable[object] | None = None,
+    ) -> dict[str, int]:
+        self.clear_dataset()
+        return self.append_dataset(inputs, outputs, sample_ids=sample_ids)
+
+    def append_dataset(
+        self,
+        inputs: np.ndarray,
+        outputs: np.ndarray,
+        *,
+        sample_ids: Iterable[object] | None = None,
+    ) -> dict[str, int]:
+        if inputs.shape[0] != outputs.shape[0]:
+            raise ValueError("inputs and outputs must contain the same number of samples")
+
+        ids = (
+            list(sample_ids)
+            if sample_ids is not None
+            else [_generated_sample_id() for _ in range(inputs.shape[0])]
+        )
+        if len(ids) != inputs.shape[0]:
+            raise ValueError("sample_ids must contain one id per sample")
+
+        ingestion_id = str(uuid.uuid4())
+        new_rows: list[tuple[bytes, str, np.ndarray, np.ndarray]] = []
+        skipped_rows = 0
+        conflict_rows = 0
+
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO dataset_ingestions(id, status, started_at)
+                VALUES(?, 'running', ?)
+                """,
+                (ingestion_id, utc_now()),
+            )
+            for sample_id, input_row, output_row in zip(ids, inputs, outputs, strict=True):
+                sample_blob = _sample_id_to_blob(sample_id)
+                fingerprint = _fingerprint_row(input_row, output_row)
+                existing = connection.execute(
+                    """
+                    SELECT content_fingerprint
+                    FROM dataset_samples
+                    WHERE sample_id_blob = ? AND status = 'committed'
+                    """,
+                    (sample_blob,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["content_fingerprint"]) == fingerprint:
+                        skipped_rows += 1
+                        continue
+                    conflict_rows += 1
+                    connection.execute(
+                        """
+                        UPDATE dataset_ingestions
+                        SET status = 'failed', conflict_rows = ?, finished_at = ?, error = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            conflict_rows,
+                            utc_now(),
+                            "conflicting sample_id with different input/output content",
+                            ingestion_id,
+                        ),
+                    )
+                    raise ValueError("conflicting sample_id with different input/output content")
+                new_rows.append((sample_blob, fingerprint, input_row, output_row))
+
+        if not new_rows:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE dataset_ingestions
+                    SET status = 'committed', skipped_rows = ?, finished_at = ?
+                    WHERE id = ?
+                    """,
+                    (skipped_rows, utc_now(), ingestion_id),
+                )
+            return {
+                "committed_rows": 0,
+                "skipped_rows": skipped_rows,
+                "conflict_rows": conflict_rows,
+            }
+
+        chunk_id = str(uuid.uuid4())
+        chunk_dir = self.chunks_path / chunk_id
+        chunk_dir.mkdir(parents=True, exist_ok=False)
+        input_path = chunk_dir / "inputs.npy"
+        output_path = chunk_dir / "outputs.npy"
+        sample_keys_path = chunk_dir / "sample_keys.npy"
+        chunk_inputs = np.asarray([row[2] for row in new_rows], dtype=np.float64)
+        chunk_outputs = np.asarray([row[3] for row in new_rows], dtype=np.float64)
+        np.save(input_path, chunk_inputs)
+        np.save(output_path, chunk_outputs)
+
+        sample_keys: list[int] = []
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO dataset_chunks(
+                    id, input_path, output_path, sample_keys_path, row_count, status, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    chunk_id,
+                    str(input_path),
+                    str(output_path),
+                    str(sample_keys_path),
+                    len(new_rows),
+                    utc_now(),
+                ),
+            )
+            for row_index, (sample_blob, fingerprint, _, _) in enumerate(new_rows):
+                cursor = connection.execute(
+                    """
+                    INSERT INTO dataset_samples(
+                        sample_id_blob, content_fingerprint, chunk_id,
+                        row_index, status, created_at
+                    )
+                    VALUES(?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (sample_blob, fingerprint, chunk_id, row_index, utc_now()),
+                )
+                sample_keys.append(int(cursor.lastrowid))
+
+            np.save(sample_keys_path, np.asarray(sample_keys, dtype=np.uint64))
+            connection.execute(
+                "UPDATE dataset_samples SET status = 'committed' WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            connection.execute(
+                "UPDATE dataset_chunks SET status = 'committed', committed_at = ? WHERE id = ?",
+                (utc_now(), chunk_id),
+            )
+            connection.execute(
+                """
+                UPDATE dataset_ingestions
+                SET status = 'committed',
+                    committed_rows = ?,
+                    skipped_rows = ?,
+                    conflict_rows = ?,
+                    finished_at = ?
+                WHERE id = ?
+                """,
+                (len(new_rows), skipped_rows, conflict_rows, utc_now(), ingestion_id),
+            )
+
+        return {
+            "committed_rows": len(new_rows),
+            "skipped_rows": skipped_rows,
+            "conflict_rows": conflict_rows,
+        }
+
+    def get_sample_count(self) -> int:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM dataset_samples WHERE status = 'committed'"
+            ).fetchone()
+        return int(row["count"])
+
+    def iter_dataset_batches(self, *, batch_size: int) -> Iterator[DatasetBatch]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT key
+                FROM dataset_samples
+                WHERE status = 'committed'
+                ORDER BY key
+                """
+            ).fetchall()
+        keys = np.asarray([int(row["key"]) for row in rows], dtype=np.uint64)
+        for start in range(0, keys.shape[0], batch_size):
+            batch = self.load_samples_by_keys(keys[start : start + batch_size])
+            yield DatasetBatch(
+                sample_keys=batch.sample_keys,
+                sample_ids=batch.sample_ids,
+                inputs=batch.inputs,
+                outputs=batch.outputs,
+            )
+
+    def load_samples_by_keys(self, sample_keys: np.ndarray) -> SampleBatch:
+        keys = np.asarray(sample_keys, dtype=np.uint64)
+        if keys.ndim != 1:
+            raise ValueError("sample_keys must be a 1D array")
+        if keys.shape[0] == 0:
+            dimensions = self.get_dimensions()
+            if dimensions is None:
+                raise ValueError("dataset dimensions have not been initialized")
+            input_size, output_size = dimensions
+            return SampleBatch(
+                sample_keys=keys,
+                sample_ids=[],
+                inputs=np.empty((0, input_size), dtype=np.float64),
+                outputs=np.empty((0, output_size), dtype=np.float64),
+            )
+
+        bind_marks = ",".join("?" for _ in keys)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT key, sample_id_blob, chunk_id, row_index
+                FROM dataset_samples
+                WHERE status = 'committed' AND key IN ({bind_marks})
+                """,
+                [int(key) for key in keys],
+            ).fetchall()
+
+        by_key = {int(row["key"]): row for row in rows}
+        missing = [int(key) for key in keys if int(key) not in by_key]
+        if missing:
+            raise ValueError(f"sample keys were not found: {missing[:3]}")
+
+        inputs: list[np.ndarray] = []
+        outputs: list[np.ndarray] = []
+        sample_ids: list[Any] = []
+        chunk_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for key in keys:
+            row = by_key[int(key)]
+            chunk_id = str(row["chunk_id"])
+            if chunk_id not in chunk_cache:
+                with self._lock, self._connect() as connection:
+                    chunk = connection.execute(
+                        """
+                        SELECT input_path, output_path
+                        FROM dataset_chunks
+                        WHERE id = ? AND status = 'committed'
+                        """,
+                        (chunk_id,),
+                    ).fetchone()
+                if chunk is None:
+                    raise ValueError(f"dataset chunk {chunk_id} was not found")
+                chunk_cache[chunk_id] = (
+                    np.load(str(chunk["input_path"]), mmap_mode="r"),
+                    np.load(str(chunk["output_path"]), mmap_mode="r"),
+                )
+            chunk_inputs, chunk_outputs = chunk_cache[chunk_id]
+            row_index = int(row["row_index"])
+            inputs.append(np.asarray(chunk_inputs[row_index], dtype=np.float64))
+            outputs.append(np.asarray(chunk_outputs[row_index], dtype=np.float64))
+            sample_ids.append(_sample_id_from_blob(bytes(row["sample_id_blob"])))
+
+        return SampleBatch(
+            sample_keys=keys,
+            sample_ids=sample_ids,
+            inputs=np.asarray(inputs, dtype=np.float64),
+            outputs=np.asarray(outputs, dtype=np.float64),
+        )
 
     def clear_models(self) -> None:
         with self._lock, self._connect() as connection:
@@ -368,6 +721,32 @@ def _optional_float(value: object) -> float | None:
 
 def _optional_int(value: object) -> int | None:
     return None if value is None else int(value)
+
+
+def _sample_id_to_blob(sample_id: object) -> bytes:
+    try:
+        return pickle.dumps(sample_id, protocol=5)
+    except Exception as exc:
+        raise ValueError("sample_ids must contain pickle-serializable values") from exc
+
+
+def _sample_id_from_blob(blob: bytes) -> Any:
+    return pickle.loads(blob)
+
+
+def _generated_sample_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _fingerprint_row(input_row: np.ndarray, output_row: np.ndarray) -> str:
+    input_bytes = np.ascontiguousarray(input_row, dtype=np.float64).tobytes()
+    output_bytes = np.ascontiguousarray(output_row, dtype=np.float64).tobytes()
+    digest = hashlib.sha256()
+    digest.update(len(input_bytes).to_bytes(8, "big"))
+    digest.update(input_bytes)
+    digest.update(len(output_bytes).to_bytes(8, "big"))
+    digest.update(output_bytes)
+    return digest.hexdigest()
 
 
 def _model_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
