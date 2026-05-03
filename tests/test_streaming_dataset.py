@@ -61,9 +61,15 @@ def test_sample_ids_are_exposed_and_duplicate_identical_rows_are_idempotent(tmp_
 def test_duplicate_sample_id_with_different_content_fails(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0]], [[0]], sample_ids=["same-id"])
+    chunks_dir = tmp_path / ".adaptive_ai" / "arrays" / "dataset" / "chunks"
+    before_count = ai.get_dataset().sample_count
+    before_chunks = sorted(chunks_dir.iterdir())
 
     with pytest.raises(ValueError, match="conflicting sample_id"):
         ai.put_input_output([[1]], [[0]], sample_ids=["same-id"])
+
+    assert ai.get_dataset().sample_count == before_count
+    assert sorted(chunks_dir.iterdir()) == before_chunks
 
 
 def test_equal_opaque_sample_ids_are_idempotent_across_pickle_order(tmp_path):
