@@ -215,6 +215,8 @@ def train_matrices(
 
     input_array = as_2d_float64(inputs, name="inputs")
     output_array = as_2d_float64(outputs, name="outputs", one_dim_as_column=True)
+    if input_array.shape[0] != output_array.shape[0]:
+        raise ValueError("inputs and outputs must contain the same number of samples")
     trained = [np.array(matrix, dtype=np.float64, copy=True) for matrix in matrices]
     sample_count, output_count = output_array.shape
     if sample_count == 0:

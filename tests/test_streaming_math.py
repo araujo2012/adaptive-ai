@@ -4,6 +4,7 @@ import pytest
 from adaptive_ai.math import (
     evaluate_matrices,
     evaluate_matrices_batches,
+    train_matrices,
     train_matrices_batches,
 )
 
@@ -46,6 +47,32 @@ def test_batch_training_reduces_mse_while_reusing_batch_factory():
     after = evaluate_matrices(inputs, outputs, trained, tolerances=[0.25])["mse"]
 
     assert after < before
+
+
+def test_train_matrices_rejects_mismatched_input_output_row_counts():
+    matrices = [np.array([[0.01], [0.0]], dtype=np.float64)]
+
+    with pytest.raises(ValueError, match="same number of samples"):
+        train_matrices(
+            [[0.0], [1.0]],
+            [[0.0]],
+            matrices,
+            steps=1,
+            learning_rate=0.1,
+        )
+
+
+def test_batch_training_rejects_mismatched_input_output_row_counts_before_update():
+    matrices = [np.array([[0.01], [0.0]], dtype=np.float64)]
+
+    def batch_factory():
+        yield (
+            np.array([[0.0], [1.0]], dtype=np.float64),
+            np.array([[0.0]], dtype=np.float64),
+        )
+
+    with pytest.raises(ValueError, match="same number of samples"):
+        train_matrices_batches(batch_factory, matrices, steps=1, learning_rate=0.1)
 
 
 def test_batch_training_rejects_empty_batch_factory():
