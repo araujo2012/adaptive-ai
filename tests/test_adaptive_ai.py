@@ -237,3 +237,46 @@ def test_training_job_streams_batches_without_loading_full_dataset(tmp_path, mon
     assert finished["rounds_completed"] >= 1
     assert finished["train_ratio"] == 0.8
     assert finished["batch_size"] == 2
+
+
+def test_start_training_normalizes_train_ratio_before_persisting(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0], [1], [2], [3]],
+        [[0], [0], [1], [1]],
+        sample_ids=[f"ratio-{index}" for index in range(4)],
+    )
+
+    job = ai.start_training(
+        max_seconds=0.2,
+        tolerances=[0.95],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.05,
+        seed=6,
+        train_ratio="0.5",
+        batch_size=2,
+    )
+    finished = wait_for_job(ai, job["job_id"])
+
+    assert finished["status"] == "completed"
+    assert finished["train_ratio"] == 0.5
+
+
+def test_start_training_rejects_invalid_train_ratio_with_value_error(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+
+    with pytest.raises(
+        ValueError,
+        match="train_ratio must be finite and greater than 0 and less than 1",
+    ):
+        ai.start_training(
+            max_seconds=0.2,
+            tolerances=[0.95],
+            amount_strategy="fixed",
+            fixed_steps=1,
+            learning_rate=0.05,
+            train_ratio="half",
+            batch_size=2,
+        )

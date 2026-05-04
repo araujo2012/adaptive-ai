@@ -141,8 +141,7 @@ class AdaptiveAI:
             raise ValueError("fixed_steps must be a positive integer when using fixed strategy")
         if learning_rate <= 0.0 or not math.isfinite(learning_rate):
             raise ValueError("learning_rate must be a positive finite number")
-        if train_ratio <= 0.0 or train_ratio >= 1.0 or not math.isfinite(train_ratio):
-            raise ValueError("train_ratio must be greater than 0 and less than 1")
+        train_ratio = _validate_train_ratio(train_ratio)
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)):
             raise ValueError("batch_size must be positive integer")
         batch_size = int(batch_size)
@@ -488,3 +487,15 @@ class AdaptiveAI:
             batch_size=batch_size,
         )
         self._storage.save_model(matrices, metrics=metrics)
+
+
+def _validate_train_ratio(train_ratio: object) -> float:
+    try:
+        ratio = float(train_ratio)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "train_ratio must be finite and greater than 0 and less than 1"
+        ) from exc
+    if not math.isfinite(ratio) or not 0.0 < ratio < 1.0:
+        raise ValueError("train_ratio must be finite and greater than 0 and less than 1")
+    return ratio
