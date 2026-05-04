@@ -1,9 +1,11 @@
+import threading
 import time
 
 import numpy as np
 import pytest
 
 from adaptive_ai import AdaptiveAI
+import adaptive_ai.api as api_module
 
 
 def wait_for_job(ai, job_id, timeout=5.0):
@@ -182,6 +184,46 @@ def test_training_job_can_be_paused_and_canceled(tmp_path):
     ai.cancel_training(canceled["job_id"])
     canceled_finished = wait_for_job(ai, canceled["job_id"])
     assert canceled_finished["status"] == "canceled"
+
+
+def test_set_input_output_rejects_replacement_while_training_is_running(
+    tmp_path, monkeypatch
+):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1], [2], [3]], [[0], [0], [1], [1]])
+
+    training_entered = threading.Event()
+    release_training = threading.Event()
+    original_train_matrices_batches = api_module.train_matrices_batches
+
+    def pause_batch_training(*args, **kwargs):
+        training_entered.set()
+        if not release_training.wait(timeout=5):
+            raise TimeoutError("training release was not signaled")
+        return original_train_matrices_batches(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "train_matrices_batches", pause_batch_training)
+    job = ai.start_training(
+        max_seconds=5.0,
+        tolerances=[0.2],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+        seed=7,
+    )
+    assert training_entered.wait(timeout=5)
+
+    with pytest.raises(
+        ValueError,
+        match="cannot replace dataset while a training job is running",
+    ):
+        ai.set_input_output([[9], [10]], [[1], [0]])
+
+    release_training.set()
+    ai.cancel_training(job["job_id"])
+    finished = wait_for_job(ai, job["job_id"])
+    assert finished["status"] == "canceled"
+    assert "error" in finished
 
 
 def test_get_model_returns_matrices_and_mutation_prunes_pool_to_sqrt_dataset(tmp_path):

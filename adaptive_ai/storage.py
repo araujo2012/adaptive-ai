@@ -96,6 +96,7 @@ class _ProcessDatasetLockState:
     def __init__(self) -> None:
         self.guard = threading.Lock()
         self.file_lock: _CrossProcessFileLock | None = None
+        self.owner_thread_id: int | None = None
         self.count = 0
 
 
@@ -358,22 +359,22 @@ class Storage:
         self,
         *,
         blocking: bool = True,
-        share_existing: bool = True,
     ) -> Iterator[bool]:
         state = self._dataset_lock_state_for(self.dataset_lock_path)
         acquired = False
+        current_thread_id = threading.get_ident()
         try:
             while not acquired:
                 wait_for_active_lock = False
                 with state.guard:
                     if state.count > 0:
-                        if not share_existing and not blocking:
-                            yield False
-                            return
-                        if share_existing:
+                        if state.owner_thread_id == current_thread_id:
                             state.count += 1
                             acquired = True
                             break
+                        if not blocking:
+                            yield False
+                            return
                         wait_for_active_lock = True
                 if wait_for_active_lock:
                     time.sleep(0.05)
@@ -391,11 +392,9 @@ class Storage:
                 with state.guard:
                     if state.count == 0:
                         state.file_lock = file_lock
+                        state.owner_thread_id = current_thread_id
                         state.count = 1
                         keep_file_lock = True
-                        acquired = True
-                    elif share_existing:
-                        state.count += 1
                         acquired = True
                 if not keep_file_lock:
                     file_lock.release()
@@ -414,14 +413,12 @@ class Storage:
                 if state.count == 0:
                     file_lock_to_release = state.file_lock
                     state.file_lock = None
+                    state.owner_thread_id = None
             if file_lock_to_release is not None:
                 file_lock_to_release.release()
 
     def cleanup_pending_dataset_chunks(self) -> None:
-        with self._dataset_write_lock(
-            blocking=False,
-            share_existing=False,
-        ) as cleanup_lock_acquired:
+        with self._dataset_write_lock(blocking=False) as cleanup_lock_acquired:
             if not cleanup_lock_acquired:
                 return
             self._cleanup_pending_dataset_chunks_locked()
@@ -1178,7 +1175,7 @@ class Storage:
             if row is not None:
                 return self._training_split_from_row(row)
 
-        with self._dataset_write_lock(share_existing=False):
+        with self._dataset_write_lock():
             with self._lock, self._connect() as connection:
                 row = connection.execute(
                     "SELECT * FROM training_splits WHERE job_id = ?",

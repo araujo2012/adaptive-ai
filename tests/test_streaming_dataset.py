@@ -82,19 +82,10 @@ def _guard_dataset_sample_in_bind_count(ai, monkeypatch, *, max_binds):
     return bind_counts
 
 
-def _run_concurrent_appends(tmp_path, monkeypatch, jobs):
+def _run_concurrent_appends(tmp_path, _monkeypatch, jobs):
     start_barrier = threading.Barrier(len(jobs))
-    write_barrier = threading.Barrier(len(jobs))
     outcomes = []
     outcomes_lock = threading.Lock()
-    original_save = storage_module.np.save
-
-    def synchronized_chunk_input_save(path, *args, **kwargs):
-        if str(path).endswith("inputs.npy"):
-            write_barrier.wait(timeout=5)
-        return original_save(path, *args, **kwargs)
-
-    monkeypatch.setattr(storage_module.np, "save", synchronized_chunk_input_save)
 
     def run_job(job):
         ai = AdaptiveAI(path=tmp_path)
@@ -686,6 +677,125 @@ def test_concurrent_conflicting_appends_return_clear_conflict(tmp_path, monkeypa
     assert "conflicting sample_id" in str(errors[0])
     assert ai.get_dataset().sample_count == 2
     assert _all_sample_ids(ai).count("race") == 1
+
+
+def test_same_process_replacement_waits_for_active_append(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0]], [[0]], sample_ids=["base"])
+
+    original_save = storage_module.np.save
+    append_ready = threading.Event()
+    release_append = threading.Event()
+    paused_append = False
+
+    def pause_first_append_input_save(path, *args, **kwargs):
+        nonlocal paused_append
+        if not paused_append and str(path).endswith("inputs.npy"):
+            paused_append = True
+            append_ready.set()
+            if not release_append.wait(timeout=5):
+                raise TimeoutError("append release was not signaled")
+        return original_save(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.np, "save", pause_first_append_input_save)
+    errors = []
+
+    def append_sample():
+        try:
+            ai.put_input_output([[1]], [[1]], sample_ids=["append"])
+        except Exception as exc:
+            errors.append(exc)
+
+    def replace_dataset():
+        try:
+            ai.set_input_output([[9]], [[0]], sample_ids=["replacement"])
+        except Exception as exc:
+            errors.append(exc)
+
+    append_thread = threading.Thread(target=append_sample)
+    append_thread.start()
+    assert append_ready.wait(timeout=5)
+
+    replace_thread = threading.Thread(target=replace_dataset)
+    replace_thread.start()
+    time.sleep(0.1)
+    assert replace_thread.is_alive()
+
+    release_append.set()
+    append_thread.join(timeout=5)
+    replace_thread.join(timeout=5)
+
+    assert not append_thread.is_alive()
+    assert not replace_thread.is_alive()
+    assert errors == []
+    assert _all_sample_ids(ai) == ["replacement"]
+
+
+def test_same_process_append_waits_for_active_split_creation(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[float(index)] for index in range(4)],
+        [[float(index % 2)] for index in range(4)],
+        sample_ids=[f"split-lock-{index}" for index in range(4)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+
+    original_save = storage_module.np.save
+    split_ready = threading.Event()
+    release_split = threading.Event()
+    paused_split = False
+
+    def pause_split_train_key_save(path, *args, **kwargs):
+        nonlocal paused_split
+        path_text = str(path)
+        if (
+            not paused_split
+            and "job_splits" in path_text
+            and path_text.endswith("_train_keys.npy")
+        ):
+            paused_split = True
+            split_ready.set()
+            if not release_split.wait(timeout=5):
+                raise TimeoutError("split release was not signaled")
+        return original_save(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.np, "save", pause_split_train_key_save)
+    errors = []
+
+    def create_split():
+        try:
+            ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+        except Exception as exc:
+            errors.append(exc)
+
+    def append_sample():
+        try:
+            ai.put_input_output([[4]], [[0]], sample_ids=["after-split-start"])
+        except Exception as exc:
+            errors.append(exc)
+
+    split_thread = threading.Thread(target=create_split)
+    split_thread.start()
+    assert split_ready.wait(timeout=5)
+
+    append_thread = threading.Thread(target=append_sample)
+    append_thread.start()
+    time.sleep(0.1)
+    assert append_thread.is_alive()
+
+    release_split.set()
+    split_thread.join(timeout=5)
+    append_thread.join(timeout=5)
+
+    assert not split_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert errors == []
+    assert ai.get_dataset().sample_count == 5
 
 
 def test_equal_opaque_sample_ids_are_idempotent_across_pickle_order(tmp_path):

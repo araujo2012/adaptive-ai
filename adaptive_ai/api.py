@@ -49,10 +49,16 @@ class AdaptiveAI:
         *,
         sample_ids: Sequence[object] | None = None,
     ) -> None:
+        with self._controls_lock:
+            if self._storage.has_running_job():
+                raise ValueError("cannot replace dataset while a training job is running")
         input_array, output_array = self._prepare_dataset(inputs, outputs)
-        self._ensure_or_set_dimensions(input_array.shape[1], output_array.shape[1])
-        self._storage.replace_dataset(input_array, output_array, sample_ids=sample_ids)
-        self._storage.clear_models()
+        with self._controls_lock:
+            if self._storage.has_running_job():
+                raise ValueError("cannot replace dataset while a training job is running")
+            self._ensure_or_set_dimensions(input_array.shape[1], output_array.shape[1])
+            self._storage.replace_dataset(input_array, output_array, sample_ids=sample_ids)
+            self._storage.clear_models()
 
     def put_input_output(
         self,
