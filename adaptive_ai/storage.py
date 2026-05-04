@@ -560,20 +560,12 @@ class Storage:
             )
 
     def save_dataset(self, inputs: np.ndarray, outputs: np.ndarray) -> None:
-        self.replace_dataset(inputs, outputs)
+        raise RuntimeError("full-array dataset storage has been replaced by chunked storage")
 
     def load_dataset(self) -> dict[str, np.ndarray]:
-        if self.get_sample_count() > 0:
-            batches = list(self.iter_dataset_batches(batch_size=1024))
-            return {
-                "inputs": np.vstack([batch.inputs for batch in batches]),
-                "outputs": np.vstack([batch.outputs for batch in batches]),
-            }
-
-        path = self.dataset_file()
-        if path.exists():
-            self.raise_if_legacy_dataset_requires_migration()
-        raise ValueError("dataset has not been set")
+        raise RuntimeError(
+            "full-array dataset loading is not available; use streaming batches"
+        )
 
     def clear_dataset(self) -> None:
         with self._lock, self._connect() as connection:

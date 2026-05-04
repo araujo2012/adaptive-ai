@@ -929,14 +929,29 @@ def test_dataset_iteration_does_not_materialize_all_sample_keys(tmp_path, monkey
     assert len(call_sizes) >= 3
 
 
-def test_dataset_view_does_not_support_full_array_indexing(tmp_path):
+def test_full_array_dataset_loading_is_explicitly_unavailable(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
 
     dataset = ai.get_dataset()
+    batches = list(dataset.iter_batches(batch_size=10))
+    np.testing.assert_allclose(batches[0].inputs, [[0, 0], [1, 1]])
+    np.testing.assert_allclose(batches[0].outputs, [[0], [1]])
 
-    with pytest.raises(TypeError):
-        dataset["inputs"]
+    with pytest.raises(RuntimeError, match="full-array dataset loading is not available"):
+        ai._storage.load_dataset()
+
+
+def test_full_array_dataset_saving_is_explicitly_unavailable(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+
+    with pytest.raises(RuntimeError, match="full-array dataset storage has been replaced"):
+        ai._storage.save_dataset(
+            np.array([[0, 0], [1, 1]], dtype=np.float64),
+            np.array([[0], [1]], dtype=np.float64),
+        )
+
+    assert ai._storage.get_sample_count() == 0
 
 
 def test_legacy_dataset_npz_without_chunks_requires_explicit_migration(tmp_path):

@@ -25,7 +25,7 @@ def test_workspace_is_created_with_sqlite_and_array_directories(tmp_path):
     assert (tmp_path / ".adaptive_ai" / "models").is_dir()
 
 
-def test_set_and_put_input_output_persist_float64_dataset(tmp_path):
+def test_set_and_put_input_output_persist_float64_streaming_dataset(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
 
     ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
@@ -208,18 +208,13 @@ def test_get_model_returns_matrices_and_mutation_prunes_pool_to_sqrt_dataset(tmp
     assert all(matrix.dtype == np.float64 for matrix in model["matrices"])
 
 
-def test_training_job_streams_batches_without_loading_full_dataset(tmp_path, monkeypatch):
+def test_training_job_streams_batches_without_loading_full_dataset(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output(
         [[0], [1], [2], [3], [4]],
         [[0], [0], [1], [1], [1]],
         sample_ids=[f"sample-{index}" for index in range(5)],
     )
-
-    def fail_if_called():
-        raise AssertionError("training must not load the full dataset")
-
-    monkeypatch.setattr(ai._storage, "load_dataset", fail_if_called, raising=False)
 
     job = ai.start_training(
         max_seconds=0.2,
