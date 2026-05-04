@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -244,25 +244,6 @@ def train_matrices(
     return trained
 
 
-def _next_batch(
-    batch_factory: Callable[[], Iterable[object]],
-    iterator: Iterable[object],
-    *,
-    restart: bool = True,
-) -> tuple[object, Iterable[object]]:
-    batch_iterator = iter(iterator)
-    try:
-        return next(batch_iterator), batch_iterator
-    except StopIteration:
-        if not restart:
-            raise ValueError("training requires at least one sample") from None
-        batch_iterator = iter(batch_factory())
-        try:
-            return next(batch_iterator), batch_iterator
-        except StopIteration:
-            raise ValueError("training requires at least one sample") from None
-
-
 def train_matrices_batches(
     batch_factory: Callable[[], Iterable[object]],
     matrices: Sequence[np.ndarray],
@@ -279,15 +260,30 @@ def train_matrices_batches(
     if steps == 0:
         return trained
 
-    iterator = iter(batch_factory())
-    pending_batch, iterator = _next_batch(batch_factory, iterator, restart=False)
-    missing_batch = object()
+    iterator: Iterator[object] | None = None
+    saw_batch = False
 
     for _ in range(steps):
         if stop_checker is not None and stop_checker():
             break
-        if pending_batch is missing_batch:
-            pending_batch, iterator = _next_batch(batch_factory, iterator)
+
+        if iterator is None:
+            iterator = iter(batch_factory())
+
+        restarted = False
+        while True:
+            try:
+                pending_batch = next(iterator)
+                saw_batch = True
+                break
+            except StopIteration:
+                if stop_checker is not None and stop_checker():
+                    return trained
+                if not saw_batch or restarted:
+                    raise ValueError("training requires at least one sample") from None
+                iterator = iter(batch_factory())
+                restarted = True
+
         input_batch, output_batch = _batch_inputs_outputs(pending_batch)
         trained = train_matrices(
             input_batch,
@@ -296,7 +292,6 @@ def train_matrices_batches(
             steps=1,
             learning_rate=learning_rate,
         )
-        pending_batch = missing_batch
 
     return trained
 

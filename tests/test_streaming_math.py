@@ -57,3 +57,26 @@ def test_batch_training_rejects_empty_batch_factory():
 
     with pytest.raises(ValueError, match="training requires at least one sample"):
         train_matrices_batches(batch_factory, matrices, steps=1, learning_rate=0.1)
+
+
+def test_batch_training_checks_stop_before_fetching_first_batch():
+    matrices = [np.array([[0.01], [0.0]], dtype=np.float64)]
+    factory_calls = 0
+
+    def batch_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("batch_factory should not be called")
+        yield
+
+    trained = train_matrices_batches(
+        batch_factory,
+        matrices,
+        steps=10,
+        learning_rate=0.1,
+        stop_checker=lambda: True,
+    )
+
+    assert factory_calls == 0
+    assert trained is not matrices
+    np.testing.assert_allclose(trained[0], matrices[0])
