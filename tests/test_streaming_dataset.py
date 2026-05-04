@@ -374,11 +374,11 @@ def test_create_job_rejects_invalid_train_ratio(tmp_path, train_ratio):
         )
 
 
-@pytest.mark.parametrize("batch_size", [0, -1])
+@pytest.mark.parametrize("batch_size", [0, -1, 1.5, float("nan"), float("inf")])
 def test_create_job_rejects_invalid_batch_size(tmp_path, batch_size):
     ai = AdaptiveAI(path=tmp_path)
 
-    with pytest.raises(ValueError, match="batch_size must be positive"):
+    with pytest.raises(ValueError, match="batch_size must be positive integer"):
         ai._storage.create_job(
             max_seconds=1.0,
             amount_strategy="fixed",
@@ -511,6 +511,98 @@ def test_training_split_rejects_invalid_train_ratio(tmp_path, train_ratio):
         match="train_ratio must be finite and greater than 0 and less than 1",
     ):
         ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=train_ratio)
+
+
+@pytest.mark.parametrize("train_ratio", [0.0, 1.0, float("nan"), float("inf")])
+def test_existing_training_split_rejects_invalid_requested_train_ratio(
+    tmp_path, train_ratio
+):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0.0], [1.0], [2.0]],
+        [[0.0], [1.0], [0.0]],
+        sample_ids=["left", "middle", "right"],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+    ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+
+    with pytest.raises(
+        ValueError,
+        match="train_ratio must be finite and greater than 0 and less than 1",
+    ):
+        ai._storage.get_or_create_training_split(
+            job_id,
+            seed=2,
+            train_ratio=train_ratio,
+        )
+
+
+def test_training_split_reports_missing_key_file_as_value_error(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0.0], [1.0], [2.0]],
+        [[0.0], [1.0], [0.0]],
+        sample_ids=["left", "middle", "right"],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+    split = ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+    split.train_path.unlink()
+
+    with pytest.raises(ValueError, match="training split train keys file is missing"):
+        ai._storage.get_or_create_training_split(job_id, seed=2, train_ratio=0.8)
+
+
+def test_training_split_rejects_key_files_that_do_not_match_metadata(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[float(index)] for index in range(5)],
+        [[float(index % 2)] for index in range(5)],
+        sample_ids=[f"count-{index}" for index in range(5)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+    split = ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+    np.save(split.train_path, split.train_keys[:1])
+
+    with pytest.raises(
+        ValueError,
+        match="training split train keys count does not match metadata",
+    ):
+        ai._storage.get_or_create_training_split(job_id, seed=2, train_ratio=0.8)
+
+
+def test_training_split_rejects_non_1d_key_files(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[float(index)] for index in range(5)],
+        [[float(index % 2)] for index in range(5)],
+        sample_ids=[f"shape-{index}" for index in range(5)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+    split = ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+    np.save(split.validation_path, split.validation_keys.reshape(1, -1))
+
+    with pytest.raises(ValueError, match="training split validation keys must be 1D"):
+        ai._storage.get_or_create_training_split(job_id, seed=2, train_ratio=0.8)
 
 
 def test_training_split_uses_job_train_ratio_for_new_split(tmp_path):

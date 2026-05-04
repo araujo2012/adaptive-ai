@@ -1177,6 +1177,7 @@ class Storage:
     def get_or_create_training_split(
         self, job_id: str, *, seed: int | None, train_ratio: float
     ) -> TrainingSplit:
+        requested_train_ratio = _validate_train_ratio(train_ratio)
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM training_splits WHERE job_id = ?",
@@ -1185,7 +1186,6 @@ class Storage:
             if row is not None:
                 return self._training_split_from_row(row)
 
-        requested_train_ratio = _validate_train_ratio(train_ratio)
         with self._dataset_write_lock(share_existing=False):
             with self._lock, self._connect() as connection:
                 row = connection.execute(
@@ -1290,15 +1290,23 @@ class Storage:
     def _training_split_from_row(self, row: sqlite3.Row) -> TrainingSplit:
         train_path = Path(str(row["train_path"]))
         validation_path = Path(str(row["validation_path"]))
-        train_keys = np.asarray(np.load(train_path), dtype=np.uint64)
-        validation_keys = np.asarray(np.load(validation_path), dtype=np.uint64)
+        train_keys = _load_training_split_keys(
+            train_path,
+            label="train",
+            expected_count=int(row["train_count"]),
+        )
+        validation_keys = _load_training_split_keys(
+            validation_path,
+            label="validation",
+            expected_count=int(row["validation_count"]),
+        )
         seed = row["seed"]
         return TrainingSplit(
             train_keys=train_keys,
             validation_keys=validation_keys,
             train_path=train_path,
             validation_path=validation_path,
-            train_ratio=float(row["train_ratio"]),
+            train_ratio=_validate_train_ratio(float(row["train_ratio"])),
             seed=None if seed is None else int(seed),
         )
 
@@ -1496,8 +1504,7 @@ class Storage:
         batch_size: int = 1024,
     ) -> str:
         train_ratio = _validate_train_ratio(train_ratio)
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
+        batch_size = _validate_batch_size(batch_size)
         job_id = str(uuid.uuid4())
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -1631,6 +1638,36 @@ def _validate_train_ratio(train_ratio: float) -> float:
     if not np.isfinite(ratio) or not 0 < ratio < 1:
         raise ValueError("train_ratio must be finite and greater than 0 and less than 1")
     return ratio
+
+
+def _validate_batch_size(batch_size: object) -> int:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)):
+        raise ValueError("batch_size must be positive integer")
+    value = int(batch_size)
+    if value <= 0:
+        raise ValueError("batch_size must be positive integer")
+    return value
+
+
+def _load_training_split_keys(
+    path: Path,
+    *,
+    label: str,
+    expected_count: int,
+) -> np.ndarray:
+    if expected_count < 0:
+        raise ValueError(f"training split {label} keys count does not match metadata")
+    if not path.exists():
+        raise ValueError(f"training split {label} keys file is missing")
+    try:
+        keys = np.asarray(np.load(path), dtype=np.uint64)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"training split {label} keys file could not be loaded") from exc
+    if keys.ndim != 1:
+        raise ValueError(f"training split {label} keys must be 1D")
+    if int(keys.shape[0]) != expected_count:
+        raise ValueError(f"training split {label} keys count does not match metadata")
+    return keys
 
 
 def _prepare_dataset_rows(
