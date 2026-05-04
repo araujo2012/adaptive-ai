@@ -285,6 +285,8 @@ def train_matrices_batches(
                 restarted = True
 
         input_batch, output_batch = _batch_inputs_outputs(pending_batch)
+        if stop_checker is not None and stop_checker():
+            return trained
         trained = train_matrices(
             input_batch,
             output_batch,

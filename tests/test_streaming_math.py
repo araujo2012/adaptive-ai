@@ -80,3 +80,25 @@ def test_batch_training_checks_stop_before_fetching_first_batch():
     assert factory_calls == 0
     assert trained is not matrices
     np.testing.assert_allclose(trained[0], matrices[0])
+
+
+def test_batch_training_checks_stop_after_fetch_before_update():
+    inputs = np.array([[1.0]], dtype=np.float64)
+    outputs = np.array([[1.0]], dtype=np.float64)
+    matrices = [np.array([[0.01], [0.0]], dtype=np.float64)]
+    stop_now = False
+
+    def batch_factory():
+        nonlocal stop_now
+        stop_now = True
+        yield inputs, outputs
+
+    trained = train_matrices_batches(
+        batch_factory,
+        matrices,
+        steps=1,
+        learning_rate=0.5,
+        stop_checker=lambda: stop_now,
+    )
+
+    np.testing.assert_allclose(trained[0], matrices[0])
