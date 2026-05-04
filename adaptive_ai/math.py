@@ -1,11 +1,61 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 
 ArrayList = list[np.ndarray]
+
+
+@dataclass
+class MetricAccumulator:
+    accepted_count: int = 0
+    sample_count: int = 0
+    squared_error_sum: float = 0.0
+    output_count: int | None = None
+
+    def update(
+        self,
+        predicted: object,
+        expected: object,
+        tolerances: Sequence[float],
+    ) -> None:
+        predicted_array = as_2d_float64(predicted, name="predicted", one_dim_as_column=True)
+        expected_array = as_2d_float64(expected, name="expected", one_dim_as_column=True)
+        if predicted_array.shape != expected_array.shape:
+            raise ValueError("predicted and expected must have the same shape")
+        tolerance_array = np.asarray(tolerances, dtype=np.float64)
+        if tolerance_array.ndim != 1 or tolerance_array.shape[0] != expected_array.shape[1]:
+            raise ValueError("tolerances must match the output dimension")
+        if (tolerance_array < 0.0).any() or not np.isfinite(tolerance_array).all():
+            raise ValueError("tolerances must contain non-negative finite numbers")
+
+        if self.output_count is None:
+            self.output_count = int(expected_array.shape[1])
+        elif self.output_count != expected_array.shape[1]:
+            raise ValueError("batch output dimensions must match")
+
+        differences = predicted_array - expected_array
+        accepted_mask = (np.abs(differences) <= tolerance_array).all(axis=1)
+        self.accepted_count += int(np.sum(accepted_mask))
+        self.sample_count += int(expected_array.shape[0])
+        self.squared_error_sum += float(np.sum(np.square(differences)))
+
+    def metrics(self) -> dict[str, float | int]:
+        element_count = (
+            self.sample_count * self.output_count if self.output_count is not None else 0
+        )
+        return {
+            "accepted_count": self.accepted_count,
+            "accepted_rate": float(self.accepted_count / self.sample_count)
+            if self.sample_count
+            else 0.0,
+            "mse": float(self.squared_error_sum / element_count)
+            if element_count
+            else float("nan"),
+        }
 
 
 def as_2d_float64(values: object, *, name: str, one_dim_as_column: bool = False) -> np.ndarray:
@@ -116,6 +166,26 @@ def evaluate_matrices(
     return evaluate_predictions(predictions, output_array, tolerances)
 
 
+def _batch_inputs_outputs(batch: object) -> tuple[object, object]:
+    if hasattr(batch, "inputs") and hasattr(batch, "outputs"):
+        return getattr(batch, "inputs"), getattr(batch, "outputs")
+    inputs, outputs = batch
+    return inputs, outputs
+
+
+def evaluate_matrices_batches(
+    batches: Iterable[object],
+    matrices: Sequence[np.ndarray],
+    tolerances: Sequence[float],
+) -> dict[str, float | int]:
+    accumulator = MetricAccumulator()
+    for batch in batches:
+        input_batch, output_batch = _batch_inputs_outputs(batch)
+        predictions = predict(input_batch, matrices)
+        accumulator.update(predictions, output_batch, tolerances)
+    return accumulator.metrics()
+
+
 def is_better(
     candidate: dict[str, float | int],
     baseline: dict[str, float | int],
@@ -170,6 +240,63 @@ def train_matrices(
                 )
         for index, gradient in enumerate(gradients):
             trained[index] = trained[index] - learning_rate * gradient
+
+    return trained
+
+
+def _next_batch(
+    batch_factory: Callable[[], Iterable[object]],
+    iterator: Iterable[object],
+    *,
+    restart: bool = True,
+) -> tuple[object, Iterable[object]]:
+    batch_iterator = iter(iterator)
+    try:
+        return next(batch_iterator), batch_iterator
+    except StopIteration:
+        if not restart:
+            raise ValueError("training requires at least one sample") from None
+        batch_iterator = iter(batch_factory())
+        try:
+            return next(batch_iterator), batch_iterator
+        except StopIteration:
+            raise ValueError("training requires at least one sample") from None
+
+
+def train_matrices_batches(
+    batch_factory: Callable[[], Iterable[object]],
+    matrices: Sequence[np.ndarray],
+    steps: int,
+    learning_rate: float,
+    stop_checker: Callable[[], bool] | None = None,
+) -> ArrayList:
+    if steps < 0:
+        raise ValueError("steps must be non-negative")
+    if learning_rate <= 0.0 or not np.isfinite(learning_rate):
+        raise ValueError("learning_rate must be a positive finite number")
+
+    trained = [np.array(matrix, dtype=np.float64, copy=True) for matrix in matrices]
+    if steps == 0:
+        return trained
+
+    iterator = iter(batch_factory())
+    pending_batch, iterator = _next_batch(batch_factory, iterator, restart=False)
+    missing_batch = object()
+
+    for _ in range(steps):
+        if stop_checker is not None and stop_checker():
+            break
+        if pending_batch is missing_batch:
+            pending_batch, iterator = _next_batch(batch_factory, iterator)
+        input_batch, output_batch = _batch_inputs_outputs(pending_batch)
+        trained = train_matrices(
+            input_batch,
+            output_batch,
+            trained,
+            steps=1,
+            learning_rate=learning_rate,
+        )
+        pending_batch = missing_batch
 
     return trained
 
