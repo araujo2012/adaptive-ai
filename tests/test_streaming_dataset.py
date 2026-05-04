@@ -305,6 +305,94 @@ def test_iter_key_batches_yields_requested_keys_in_batch_size(tmp_path):
     )
 
 
+def test_list_sample_keys_returns_committed_compact_keys(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0.0], [1.0], [2.0]],
+        [[0.0], [1.0], [0.0]],
+        sample_ids=["left", "middle", "right"],
+    )
+
+    sample_keys = ai._storage.list_sample_keys()
+
+    assert sample_keys.dtype == np.uint64
+    assert sample_keys.shape == (3,)
+
+
+def test_training_split_materializes_random_compact_keys_and_persists_them(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    inputs = [[float(index)] for index in range(10)]
+    outputs = [[float(index % 2)] for index in range(10)]
+    ai.set_input_output(
+        inputs,
+        outputs,
+        sample_ids=[f"ts-{index}" for index in range(10)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+        train_ratio=0.8,
+        batch_size=2,
+    )
+
+    split = ai._storage.get_or_create_training_split(job_id, seed=42, train_ratio=0.8)
+    loaded = ai._storage.get_or_create_training_split(job_id, seed=999, train_ratio=0.5)
+
+    assert split.train_keys.dtype == np.uint64
+    assert split.validation_keys.dtype == np.uint64
+    assert split.train_keys.shape[0] == 8
+    assert split.validation_keys.shape[0] == 2
+    assert split.train_path.exists()
+    assert split.validation_path.exists()
+    np.testing.assert_array_equal(loaded.train_keys, split.train_keys)
+    np.testing.assert_array_equal(loaded.validation_keys, split.validation_keys)
+    assert set(split.train_keys.tolist()).isdisjoint(set(split.validation_keys.tolist()))
+
+    job = ai.get_training_job(job_id)
+    assert job["train_ratio"] == 0.8
+    assert job["batch_size"] == 2
+    assert job["train_cursor"] == 0
+    assert job["validation_cursor"] == 0
+
+
+def test_training_split_requires_at_least_two_samples(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0.0]], [[0.0]], sample_ids=["only"])
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+
+    with pytest.raises(ValueError, match="at least 2 samples"):
+        ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+
+
+@pytest.mark.parametrize("train_ratio", [0.0, 1.0])
+def test_training_split_rejects_invalid_train_ratio(tmp_path, train_ratio):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0.0], [1.0]],
+        [[0.0], [1.0]],
+        sample_ids=["left", "right"],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="train_ratio must be greater than 0 and less than 1",
+    ):
+        ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=train_ratio)
+
+
 def test_duplicate_sample_id_with_different_content_fails(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0]], [[0]], sample_ids=["same-id"])

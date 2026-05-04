@@ -17,7 +17,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from .dataset import DatasetBatch, SampleBatch
+from .dataset import DatasetBatch, SampleBatch, TrainingSplit
 from .math import architecture_from_matrices
 
 
@@ -172,7 +172,11 @@ class Storage:
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     rounds_completed INTEGER NOT NULL DEFAULT 0,
-                    error TEXT
+                    error TEXT,
+                    train_ratio REAL NOT NULL DEFAULT 0.8,
+                    batch_size INTEGER NOT NULL DEFAULT 1024,
+                    train_cursor INTEGER NOT NULL DEFAULT 0,
+                    validation_cursor INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS job_logs (
@@ -236,8 +240,24 @@ class Storage:
                 );
                 """
             )
+            self._ensure_job_split_metadata_columns(connection)
             self._ensure_dataset_chunk_ingestion_id(connection)
             self._ensure_dataset_sample_id_key(connection)
+
+    def _ensure_job_split_metadata_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        definitions = {
+            "train_ratio": "REAL NOT NULL DEFAULT 0.8",
+            "batch_size": "INTEGER NOT NULL DEFAULT 1024",
+            "train_cursor": "INTEGER NOT NULL DEFAULT 0",
+            "validation_cursor": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
     def _ensure_dataset_chunk_ingestion_id(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -1057,6 +1077,18 @@ class Storage:
             ).fetchone()
         return int(row["count"])
 
+    def list_sample_keys(self) -> np.ndarray:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT key
+                FROM dataset_samples
+                WHERE status = 'committed'
+                ORDER BY key
+                """
+            ).fetchall()
+        return np.asarray([int(row["key"]) for row in rows], dtype=np.uint64)
+
     def iter_dataset_batches(self, *, batch_size: int) -> Iterator[DatasetBatch]:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -1135,6 +1167,93 @@ class Storage:
             raise ValueError("batch_size must be positive")
         for start in range(0, keys.shape[0], batch_size):
             yield self.load_samples_by_keys(keys[start : start + batch_size])
+
+    def get_or_create_training_split(
+        self, job_id: str, *, seed: int, train_ratio: float
+    ) -> TrainingSplit:
+        with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM training_splits WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is not None:
+                    return self._training_split_from_row(row)
+
+                job = connection.execute(
+                    "SELECT id FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if job is None:
+                    raise ValueError(f"training job {job_id} was not found")
+
+            sample_keys = self.list_sample_keys()
+            sample_count = int(sample_keys.shape[0])
+            if sample_count < 2:
+                raise ValueError("training split requires at least 2 samples")
+            if not 0 < train_ratio < 1:
+                raise ValueError("train_ratio must be greater than 0 and less than 1")
+
+            shuffled_keys = sample_keys.copy()
+            np.random.default_rng(seed).shuffle(shuffled_keys)
+            train_count = min(
+                max(1, int(sample_count * train_ratio)),
+                sample_count - 1,
+            )
+            train_keys = np.asarray(shuffled_keys[:train_count], dtype=np.uint64)
+            validation_keys = np.asarray(shuffled_keys[train_count:], dtype=np.uint64)
+
+            self.job_splits_path.mkdir(parents=True, exist_ok=True)
+            train_path = self.job_splits_path / f"{job_id}_train_keys.npy"
+            validation_path = self.job_splits_path / f"{job_id}_validation_keys.npy"
+            np.save(train_path, train_keys)
+            np.save(validation_path, validation_keys)
+
+            now = utc_now()
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO training_splits(
+                        job_id, seed, train_ratio, train_path, validation_path,
+                        train_count, validation_count, created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        seed,
+                        train_ratio,
+                        str(train_path),
+                        str(validation_path),
+                        int(train_keys.shape[0]),
+                        int(validation_keys.shape[0]),
+                        now,
+                    ),
+                )
+
+            return TrainingSplit(
+                train_keys=train_keys,
+                validation_keys=validation_keys,
+                train_path=train_path,
+                validation_path=validation_path,
+                train_ratio=float(train_ratio),
+                seed=int(seed),
+            )
+
+    def _training_split_from_row(self, row: sqlite3.Row) -> TrainingSplit:
+        train_path = Path(str(row["train_path"]))
+        validation_path = Path(str(row["validation_path"]))
+        train_keys = np.asarray(np.load(train_path), dtype=np.uint64)
+        validation_keys = np.asarray(np.load(validation_path), dtype=np.uint64)
+        seed = row["seed"]
+        return TrainingSplit(
+            train_keys=train_keys,
+            validation_keys=validation_keys,
+            train_path=train_path,
+            validation_path=validation_path,
+            train_ratio=float(row["train_ratio"]),
+            seed=None if seed is None else int(seed),
+        )
 
     def load_samples_by_keys(self, sample_keys: np.ndarray) -> SampleBatch:
         keys = np.asarray(sample_keys, dtype=np.uint64)
@@ -1326,6 +1445,8 @@ class Storage:
         amount_strategy: str,
         fixed_steps: int | None,
         learning_rate: float,
+        train_ratio: float = 0.8,
+        batch_size: int = 1024,
     ) -> str:
         job_id = str(uuid.uuid4())
         with self._lock, self._connect() as connection:
@@ -1333,11 +1454,21 @@ class Storage:
                 """
                 INSERT INTO jobs(
                     id, status, max_seconds, amount_strategy, fixed_steps,
-                    learning_rate, started_at, rounds_completed
+                    learning_rate, train_ratio, batch_size, train_cursor,
+                    validation_cursor, started_at, rounds_completed
                 )
-                VALUES(?, 'running', ?, ?, ?, ?, ?, 0)
+                VALUES(?, 'running', ?, ?, ?, ?, ?, ?, 0, 0, ?, 0)
                 """,
-                (job_id, max_seconds, amount_strategy, fixed_steps, learning_rate, utc_now()),
+                (
+                    job_id,
+                    max_seconds,
+                    amount_strategy,
+                    fixed_steps,
+                    learning_rate,
+                    train_ratio,
+                    batch_size,
+                    utc_now(),
+                ),
             )
         return job_id
 
@@ -1611,6 +1742,10 @@ def _job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "amount_strategy": row["amount_strategy"],
         "fixed_steps": row["fixed_steps"],
         "learning_rate": row["learning_rate"],
+        "train_ratio": float(row["train_ratio"]),
+        "batch_size": int(row["batch_size"]),
+        "train_cursor": int(row["train_cursor"]),
+        "validation_cursor": int(row["validation_cursor"]),
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "rounds_completed": int(row["rounds_completed"]),
