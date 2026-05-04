@@ -62,6 +62,19 @@ def test_train_matrices_rejects_mismatched_input_output_row_counts():
         )
 
 
+def test_train_matrices_rejects_matrix_output_dimension_mismatch():
+    matrices = [np.array([[0.01, 0.02], [0.0, 0.0]], dtype=np.float64)]
+
+    with pytest.raises(ValueError, match="final matrix output dimension"):
+        train_matrices(
+            [[0.0], [1.0]],
+            [[0.0], [1.0]],
+            matrices,
+            steps=1,
+            learning_rate=0.1,
+        )
+
+
 def test_batch_training_rejects_mismatched_input_output_row_counts_before_update():
     matrices = [np.array([[0.01], [0.0]], dtype=np.float64)]
 
@@ -72,6 +85,19 @@ def test_batch_training_rejects_mismatched_input_output_row_counts_before_update
         )
 
     with pytest.raises(ValueError, match="same number of samples"):
+        train_matrices_batches(batch_factory, matrices, steps=1, learning_rate=0.1)
+
+
+def test_batch_training_rejects_matrix_output_dimension_mismatch():
+    matrices = [np.array([[0.01, 0.02], [0.0, 0.0]], dtype=np.float64)]
+
+    def batch_factory():
+        yield (
+            np.array([[0.0], [1.0]], dtype=np.float64),
+            np.array([[0.0], [1.0]], dtype=np.float64),
+        )
+
+    with pytest.raises(ValueError, match="final matrix output dimension"):
         train_matrices_batches(batch_factory, matrices, steps=1, learning_rate=0.1)
 
 
