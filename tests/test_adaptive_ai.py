@@ -206,3 +206,34 @@ def test_get_model_returns_matrices_and_mutation_prunes_pool_to_sqrt_dataset(tmp
     model = ai.get_model(models[0]["model_id"])
     assert model["matrices"]
     assert all(matrix.dtype == np.float64 for matrix in model["matrices"])
+
+
+def test_training_job_streams_batches_without_loading_full_dataset(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0], [1], [2], [3], [4]],
+        [[0], [0], [1], [1], [1]],
+        sample_ids=[f"sample-{index}" for index in range(5)],
+    )
+
+    def fail_if_called():
+        raise AssertionError("training must not load the full dataset")
+
+    monkeypatch.setattr(ai._storage, "load_dataset", fail_if_called, raising=False)
+
+    job = ai.start_training(
+        max_seconds=0.2,
+        tolerances=[0.95],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.05,
+        seed=5,
+        train_ratio=0.8,
+        batch_size=2,
+    )
+    finished = wait_for_job(ai, job["job_id"])
+
+    assert finished["status"] == "completed"
+    assert finished["rounds_completed"] >= 1
+    assert finished["train_ratio"] == 0.8
+    assert finished["batch_size"] == 2
