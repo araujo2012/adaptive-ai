@@ -357,6 +357,126 @@ def test_training_split_materializes_random_compact_keys_and_persists_them(tmp_p
     assert job["validation_cursor"] == 0
 
 
+@pytest.mark.parametrize("train_ratio", [0.0, 1.0, float("nan"), float("inf")])
+def test_create_job_rejects_invalid_train_ratio(tmp_path, train_ratio):
+    ai = AdaptiveAI(path=tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="train_ratio must be finite and greater than 0 and less than 1",
+    ):
+        ai._storage.create_job(
+            max_seconds=1.0,
+            amount_strategy="fixed",
+            fixed_steps=1,
+            learning_rate=0.1,
+            train_ratio=train_ratio,
+        )
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_create_job_rejects_invalid_batch_size(tmp_path, batch_size):
+    ai = AdaptiveAI(path=tmp_path)
+
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        ai._storage.create_job(
+            max_seconds=1.0,
+            amount_strategy="fixed",
+            fixed_steps=1,
+            learning_rate=0.1,
+            batch_size=batch_size,
+        )
+
+
+def test_concurrent_training_split_creation_is_atomic(tmp_path, monkeypatch):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[float(index)] for index in range(12)],
+        [[float(index % 2)] for index in range(12)],
+        sample_ids=[f"split-race-{index}" for index in range(12)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+        train_ratio=0.8,
+        batch_size=2,
+    )
+
+    original_save = storage_module.np.save
+    entered_train_writes = 0
+    writers_ready = threading.Event()
+    save_lock = threading.Lock()
+
+    def pause_concurrent_train_key_writes(path, *args, **kwargs):
+        nonlocal entered_train_writes
+        path_text = str(path)
+        if "job_splits" in path_text and path_text.endswith("_train_keys.npy"):
+            with save_lock:
+                entered_train_writes += 1
+                if entered_train_writes == 2:
+                    writers_ready.set()
+            writers_ready.wait(timeout=0.5)
+        return original_save(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.np, "save", pause_concurrent_train_key_writes)
+
+    start_barrier = threading.Barrier(2)
+    outcomes = []
+    outcomes_lock = threading.Lock()
+
+    def create_split(seed):
+        storage = storage_module.Storage(tmp_path)
+        try:
+            start_barrier.wait(timeout=5)
+            outcome = storage.get_or_create_training_split(
+                job_id,
+                seed=seed,
+                train_ratio=0.8,
+            )
+        except Exception as exc:
+            outcome = exc
+        with outcomes_lock:
+            outcomes.append(outcome)
+
+    threads = [
+        threading.Thread(target=create_split, args=(123,)),
+        threading.Thread(target=create_split, args=(456,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert len(outcomes) == 2
+    assert not any(
+        isinstance(outcome, Exception) and _contains_integrity_error(outcome)
+        for outcome in outcomes
+    ), outcomes
+    assert all(not isinstance(outcome, Exception) for outcome in outcomes), outcomes
+
+    persisted = ai._storage.get_or_create_training_split(
+        job_id,
+        seed=999,
+        train_ratio=0.5,
+    )
+    with sqlite3.connect(tmp_path / ".adaptive_ai" / "adaptive_ai.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT train_path, validation_path FROM training_splits WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+
+    assert row is not None
+    np.testing.assert_array_equal(np.load(row["train_path"]), persisted.train_keys)
+    np.testing.assert_array_equal(
+        np.load(row["validation_path"]),
+        persisted.validation_keys,
+    )
+
+
 def test_training_split_requires_at_least_two_samples(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output([[0.0]], [[0.0]], sample_ids=["only"])
@@ -371,7 +491,7 @@ def test_training_split_requires_at_least_two_samples(tmp_path):
         ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
 
 
-@pytest.mark.parametrize("train_ratio", [0.0, 1.0])
+@pytest.mark.parametrize("train_ratio", [0.0, 1.0, float("nan"), float("inf")])
 def test_training_split_rejects_invalid_train_ratio(tmp_path, train_ratio):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output(
@@ -388,9 +508,36 @@ def test_training_split_rejects_invalid_train_ratio(tmp_path, train_ratio):
 
     with pytest.raises(
         ValueError,
-        match="train_ratio must be greater than 0 and less than 1",
+        match="train_ratio must be finite and greater than 0 and less than 1",
     ):
         ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=train_ratio)
+
+
+def test_training_split_uses_job_train_ratio_for_new_split(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[float(index)] for index in range(10)],
+        [[float(index % 2)] for index in range(10)],
+        sample_ids=[f"job-ratio-{index}" for index in range(10)],
+    )
+    job_id = ai._storage.create_job(
+        max_seconds=1.0,
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+        train_ratio=0.7,
+        batch_size=2,
+    )
+
+    with pytest.raises(ValueError, match="train_ratio must match"):
+        ai._storage.get_or_create_training_split(job_id, seed=1, train_ratio=0.8)
+
+    split = ai._storage.get_or_create_training_split(job_id, seed=None, train_ratio=0.7)
+
+    assert split.seed is None
+    assert split.train_ratio == 0.7
+    assert split.train_keys.shape[0] == 7
+    assert split.validation_keys.shape[0] == 3
 
 
 def test_duplicate_sample_id_with_different_content_fails(tmp_path):

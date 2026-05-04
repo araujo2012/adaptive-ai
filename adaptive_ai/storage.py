@@ -364,14 +364,20 @@ class Storage:
         acquired = False
         try:
             while not acquired:
+                wait_for_active_lock = False
                 with state.guard:
                     if state.count > 0:
-                        if not share_existing:
+                        if not share_existing and not blocking:
                             yield False
                             return
-                        state.count += 1
-                        acquired = True
-                        break
+                        if share_existing:
+                            state.count += 1
+                            acquired = True
+                            break
+                        wait_for_active_lock = True
+                if wait_for_active_lock:
+                    time.sleep(0.05)
+                    continue
 
                 file_lock = _CrossProcessFileLock(self.dataset_lock_path)
                 if not file_lock.acquire(blocking=False):
@@ -1169,10 +1175,19 @@ class Storage:
             yield self.load_samples_by_keys(keys[start : start + batch_size])
 
     def get_or_create_training_split(
-        self, job_id: str, *, seed: int, train_ratio: float
+        self, job_id: str, *, seed: int | None, train_ratio: float
     ) -> TrainingSplit:
-        with self._lock:
-            with self._connect() as connection:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM training_splits WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                return self._training_split_from_row(row)
+
+        requested_train_ratio = _validate_train_ratio(train_ratio)
+        with self._dataset_write_lock(share_existing=False):
+            with self._lock, self._connect() as connection:
                 row = connection.execute(
                     "SELECT * FROM training_splits WHERE job_id = ?",
                     (job_id,),
@@ -1181,23 +1196,25 @@ class Storage:
                     return self._training_split_from_row(row)
 
                 job = connection.execute(
-                    "SELECT id FROM jobs WHERE id = ?",
+                    "SELECT id, train_ratio FROM jobs WHERE id = ?",
                     (job_id,),
                 ).fetchone()
                 if job is None:
                     raise ValueError(f"training job {job_id} was not found")
+                job_train_ratio = _validate_train_ratio(float(job["train_ratio"]))
+
+            if requested_train_ratio != job_train_ratio:
+                raise ValueError("train_ratio must match the training job train_ratio")
 
             sample_keys = self.list_sample_keys()
             sample_count = int(sample_keys.shape[0])
             if sample_count < 2:
                 raise ValueError("training split requires at least 2 samples")
-            if not 0 < train_ratio < 1:
-                raise ValueError("train_ratio must be greater than 0 and less than 1")
 
             shuffled_keys = sample_keys.copy()
             np.random.default_rng(seed).shuffle(shuffled_keys)
             train_count = min(
-                max(1, int(sample_count * train_ratio)),
+                max(1, int(sample_count * job_train_ratio)),
                 sample_count - 1,
             )
             train_keys = np.asarray(shuffled_keys[:train_count], dtype=np.uint64)
@@ -1206,38 +1223,68 @@ class Storage:
             self.job_splits_path.mkdir(parents=True, exist_ok=True)
             train_path = self.job_splits_path / f"{job_id}_train_keys.npy"
             validation_path = self.job_splits_path / f"{job_id}_validation_keys.npy"
-            np.save(train_path, train_keys)
-            np.save(validation_path, validation_keys)
+            temp_token = uuid.uuid4().hex
+            temp_train_path = self.job_splits_path / f".{job_id}_{temp_token}_train_keys.npy"
+            temp_validation_path = (
+                self.job_splits_path / f".{job_id}_{temp_token}_validation_keys.npy"
+            )
+            np.save(temp_train_path, train_keys)
+            np.save(temp_validation_path, validation_keys)
 
             now = utc_now()
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO training_splits(
-                        job_id, seed, train_ratio, train_path, validation_path,
-                        train_count, validation_count, created_at
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        job_id,
-                        seed,
-                        train_ratio,
-                        str(train_path),
-                        str(validation_path),
-                        int(train_keys.shape[0]),
-                        int(validation_keys.shape[0]),
-                        now,
-                    ),
-                )
+            inserted_row = False
+            try:
+                with self._lock, self._connect() as connection:
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO training_splits(
+                                job_id, seed, train_ratio, train_path, validation_path,
+                                train_count, validation_count, created_at
+                            )
+                            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                job_id,
+                                seed,
+                                job_train_ratio,
+                                str(train_path),
+                                str(validation_path),
+                                int(train_keys.shape[0]),
+                                int(validation_keys.shape[0]),
+                                now,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        row = connection.execute(
+                            "SELECT * FROM training_splits WHERE job_id = ?",
+                            (job_id,),
+                        ).fetchone()
+                        if row is not None:
+                            for path in (temp_train_path, temp_validation_path):
+                                if path.exists():
+                                    path.unlink()
+                            return self._training_split_from_row(row)
+                        raise
+                    inserted_row = True
+                    temp_train_path.replace(train_path)
+                    temp_validation_path.replace(validation_path)
+            except Exception:
+                paths = [temp_train_path, temp_validation_path]
+                if inserted_row:
+                    paths.extend([train_path, validation_path])
+                for path in paths:
+                    if path.exists():
+                        path.unlink()
+                raise
 
             return TrainingSplit(
                 train_keys=train_keys,
                 validation_keys=validation_keys,
                 train_path=train_path,
                 validation_path=validation_path,
-                train_ratio=float(train_ratio),
-                seed=int(seed),
+                train_ratio=job_train_ratio,
+                seed=None if seed is None else int(seed),
             )
 
     def _training_split_from_row(self, row: sqlite3.Row) -> TrainingSplit:
@@ -1448,6 +1495,9 @@ class Storage:
         train_ratio: float = 0.8,
         batch_size: int = 1024,
     ) -> str:
+        train_ratio = _validate_train_ratio(train_ratio)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         job_id = str(uuid.uuid4())
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -1574,6 +1624,13 @@ def _optional_float(value: object) -> float | None:
 
 def _optional_int(value: object) -> int | None:
     return None if value is None else int(value)
+
+
+def _validate_train_ratio(train_ratio: float) -> float:
+    ratio = float(train_ratio)
+    if not np.isfinite(ratio) or not 0 < ratio < 1:
+        raise ValueError("train_ratio must be finite and greater than 0 and less than 1")
+    return ratio
 
 
 def _prepare_dataset_rows(
