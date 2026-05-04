@@ -275,3 +275,17 @@ def test_start_training_rejects_invalid_train_ratio_with_value_error(tmp_path):
             train_ratio="half",
             batch_size=2,
         )
+
+
+def test_streaming_dataset_public_usage_smoke(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+
+    dataset = ai.get_dataset()
+    first_batch = next(dataset.iter_batches(batch_size=1))
+    selected = ai.get_samples(["right"])
+
+    assert dataset.sample_count == 2
+    assert first_batch.sample_ids == ["left"]
+    assert selected.sample_ids == ["right"]
+    np.testing.assert_allclose(selected.outputs, [[1]])
