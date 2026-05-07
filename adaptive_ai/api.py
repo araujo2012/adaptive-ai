@@ -3,21 +3,25 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
+from .dataset import DatasetBatch, DatasetView, SampleBatch
 from .math import (
     as_2d_float64,
     evaluate_matrices,
+    evaluate_matrices_batches,
     evaluate_predictions,
     is_better,
     mutate_matrices,
     predict,
     random_matrix,
     train_matrices,
+    train_matrices_batches,
     validate_matrices,
     validate_outputs,
 )
@@ -38,22 +42,55 @@ class AdaptiveAI:
         self._controls: dict[str, _JobControl] = {}
         self._controls_lock = threading.RLock()
 
-    def set_input_output(self, inputs: object, outputs: object) -> None:
+    def set_input_output(
+        self,
+        inputs: object,
+        outputs: object,
+        *,
+        sample_ids: Sequence[object] | None = None,
+    ) -> None:
+        with self._controls_lock:
+            if self._storage.has_running_job():
+                raise ValueError("cannot replace dataset while a training job is running")
         input_array, output_array = self._prepare_dataset(inputs, outputs)
-        self._ensure_or_set_dimensions(input_array.shape[1], output_array.shape[1])
-        self._storage.save_dataset(input_array, output_array)
-        self._storage.clear_models()
+        with self._controls_lock:
+            if self._storage.has_running_job():
+                raise ValueError("cannot replace dataset while a training job is running")
+            self._ensure_or_set_dimensions(input_array.shape[1], output_array.shape[1])
+            self._storage.replace_dataset(input_array, output_array, sample_ids=sample_ids)
+            self._storage.clear_models()
 
-    def put_input_output(self, inputs: object, outputs: object) -> None:
+    def put_input_output(
+        self,
+        inputs: object,
+        outputs: object,
+        *,
+        sample_ids: Sequence[object] | None = None,
+    ) -> None:
         input_array, output_array = self._prepare_dataset(inputs, outputs)
         self._require_dimensions(input_array.shape[1], output_array.shape[1])
-        dataset = self._storage.load_dataset()
-        combined_inputs = np.concatenate([dataset["inputs"], input_array], axis=0)
-        combined_outputs = np.concatenate([dataset["outputs"], output_array], axis=0)
-        self._storage.save_dataset(combined_inputs, combined_outputs)
+        self._storage.append_dataset(input_array, output_array, sample_ids=sample_ids)
 
-    def get_dataset(self) -> dict[str, np.ndarray]:
-        return self._storage.load_dataset()
+    def get_samples(self, sample_ids: Sequence[object]) -> SampleBatch:
+        self._storage.raise_if_legacy_dataset_requires_migration()
+        return self._storage.load_samples_by_ids(sample_ids)
+
+    def get_dataset(self) -> DatasetView:
+        self._storage.raise_if_legacy_dataset_requires_migration()
+        dimensions = self._storage.get_dimensions()
+        if dimensions is None:
+            raise ValueError("dataset has not been set")
+        input_size, output_size = dimensions
+
+        def iter_batches(batch_size: int) -> Iterator[DatasetBatch]:
+            yield from self._storage.iter_dataset_batches(batch_size=batch_size)
+
+        return DatasetView(
+            sample_count=self._storage.get_sample_count(),
+            input_size=input_size,
+            output_size=output_size,
+            batch_iterator=iter_batches,
+        )
 
     def predict_with_matrices(self, inputs: object, matrices: Sequence[np.ndarray]) -> np.ndarray:
         input_array = as_2d_float64(inputs, name="inputs")
@@ -99,6 +136,8 @@ class AdaptiveAI:
         fixed_steps: int | None = 100,
         learning_rate: float = 0.01,
         seed: int | None = None,
+        train_ratio: float = 0.8,
+        batch_size: int = 1024,
     ) -> dict[str, Any]:
         if max_seconds <= 0.0 or not math.isfinite(max_seconds):
             raise ValueError("max_seconds must be a positive finite number")
@@ -108,9 +147,14 @@ class AdaptiveAI:
             raise ValueError("fixed_steps must be a positive integer when using fixed strategy")
         if learning_rate <= 0.0 or not math.isfinite(learning_rate):
             raise ValueError("learning_rate must be a positive finite number")
+        train_ratio = _validate_train_ratio(train_ratio)
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)):
+            raise ValueError("batch_size must be positive integer")
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive integer")
 
-        dataset = self._storage.load_dataset()
-        if dataset["inputs"].shape[0] < 2:
+        if self._storage.get_sample_count() < 2:
             raise ValueError("training requires at least two dataset samples")
         dimensions = self._storage.get_dimensions()
         if dimensions is None:
@@ -125,6 +169,8 @@ class AdaptiveAI:
                 amount_strategy=amount_strategy,
                 fixed_steps=fixed_steps,
                 learning_rate=learning_rate,
+                train_ratio=train_ratio,
+                batch_size=batch_size,
             )
             control = _JobControl(cancel_event=threading.Event(), pause_event=threading.Event())
             thread = threading.Thread(
@@ -137,6 +183,8 @@ class AdaptiveAI:
                     fixed_steps,
                     learning_rate,
                     seed,
+                    train_ratio,
+                    batch_size,
                     control,
                 ),
                 daemon=True,
@@ -229,20 +277,32 @@ class AdaptiveAI:
         fixed_steps: int | None,
         learning_rate: float,
         seed: int | None,
+        train_ratio: float,
+        batch_size: int,
         control: _JobControl,
     ) -> None:
         rounds_completed = 0
         rng = np.random.default_rng(seed)
         deadline = time.monotonic() + max_seconds
         try:
-            dataset = self._storage.load_dataset()
-            inputs = dataset["inputs"]
-            outputs = dataset["outputs"]
-            input_size, output_size = self._storage.get_dimensions() or (
-                inputs.shape[1],
-                outputs.shape[1],
+            sample_count = self._storage.get_sample_count()
+            dimensions = self._storage.get_dimensions()
+            if dimensions is None:
+                raise ValueError("dataset dimensions have not been initialized")
+            input_size, output_size = dimensions
+            split = self._storage.get_or_create_training_split(
+                job_id,
+                seed=seed,
+                train_ratio=train_ratio,
             )
-            self._ensure_model_pool(input_size, output_size, inputs, outputs, tolerances, rng)
+            self._ensure_model_pool(
+                input_size,
+                output_size,
+                split.validation_keys,
+                tolerances,
+                rng,
+                batch_size=batch_size,
+            )
 
             while time.monotonic() < deadline:
                 if control.cancel_event.is_set():
@@ -264,43 +324,37 @@ class AdaptiveAI:
 
                 models = self._storage.list_models()
                 if not models:
-                    self._ensure_model_pool(input_size, output_size, inputs, outputs, tolerances, rng)
+                    self._ensure_model_pool(
+                        input_size,
+                        output_size,
+                        split.validation_keys,
+                        tolerances,
+                        rng,
+                        batch_size=batch_size,
+                    )
                     models = self._storage.list_models()
                 selected = models[int(rng.integers(0, len(models)))]
                 selected_id = str(selected["model_id"])
                 original = self._storage.load_model(selected_id)
 
-                full_metrics = evaluate_matrices(inputs, outputs, original, tolerances)
-                validation_count = _validation_count(
-                    int(full_metrics["accepted_count"]),
-                    inputs.shape[0],
+                baseline_validation = self._evaluate_matrices_for_keys(
+                    original,
+                    split.validation_keys,
+                    tolerances,
+                    batch_size=batch_size,
                 )
-                validation_indices = rng.choice(
-                    inputs.shape[0],
-                    size=validation_count,
-                    replace=False,
-                )
-                train_mask = np.ones(inputs.shape[0], dtype=bool)
-                train_mask[validation_indices] = False
-                train_inputs = inputs[train_mask]
-                train_outputs = outputs[train_mask]
-                validation_inputs = inputs[validation_indices]
-                validation_outputs = outputs[validation_indices]
+                validation_count = int(split.validation_keys.shape[0])
                 steps = (
                     int(fixed_steps)
                     if amount_strategy == "fixed"
                     else int(validation_count * validation_count)
                 )
 
-                baseline_validation = evaluate_matrices(
-                    validation_inputs,
-                    validation_outputs,
-                    original,
-                    tolerances,
-                )
-                trained = train_matrices(
-                    train_inputs,
-                    train_outputs,
+                trained = train_matrices_batches(
+                    lambda: self._iter_input_output_batches(
+                        split.train_keys,
+                        batch_size=batch_size,
+                    ),
                     original,
                     steps=steps,
                     learning_rate=learning_rate,
@@ -325,25 +379,31 @@ class AdaptiveAI:
                     )
                     return
 
-                trained_validation = evaluate_matrices(
-                    validation_inputs,
-                    validation_outputs,
+                trained_validation = self._evaluate_matrices_for_keys(
                     trained,
+                    split.validation_keys,
                     tolerances,
+                    batch_size=batch_size,
                 )
                 kept_matrices = original
+                kept_metrics = baseline_validation
                 message = "round reverted"
                 if is_better(trained_validation, baseline_validation):
                     kept_matrices = trained
+                    kept_metrics = trained_validation
                     message = "round improved"
-                    kept_metrics = evaluate_matrices(inputs, outputs, kept_matrices, tolerances)
                     self._storage.save_model(
                         kept_matrices,
                         model_id=selected_id,
                         metrics=kept_metrics,
                     )
                     child = mutate_matrices(kept_matrices, rng)
-                    child_metrics = evaluate_matrices(inputs, outputs, child, tolerances)
+                    child_metrics = self._evaluate_matrices_for_keys(
+                        child,
+                        split.validation_keys,
+                        tolerances,
+                        batch_size=batch_size,
+                    )
                     self._storage.save_model(
                         child,
                         parent_id=selected_id,
@@ -354,12 +414,11 @@ class AdaptiveAI:
                     self._storage.save_model(
                         kept_matrices,
                         model_id=selected_id,
-                        metrics=full_metrics,
+                        metrics=kept_metrics,
                     )
 
-                max_models = max(1, math.ceil(math.sqrt(inputs.shape[0])))
+                max_models = max(1, math.ceil(math.sqrt(sample_count)))
                 self._storage.prune_models(max_models)
-                final_metrics = evaluate_matrices(inputs, outputs, kept_matrices, tolerances)
                 rounds_completed += 1
                 self._storage.add_log(
                     job_id,
@@ -367,8 +426,8 @@ class AdaptiveAI:
                     model_id=selected_id,
                     validation_count=validation_count,
                     steps=steps,
-                    accepted_rate=float(final_metrics["accepted_rate"]),
-                    mse=float(final_metrics["mse"]),
+                    accepted_rate=float(kept_metrics["accepted_rate"]),
+                    mse=float(kept_metrics["mse"]),
                 )
                 self._storage.update_job(job_id, rounds_completed=rounds_completed)
 
@@ -390,24 +449,59 @@ class AdaptiveAI:
             with self._controls_lock:
                 self._controls.pop(job_id, None)
 
+    def _iter_input_output_batches(
+        self,
+        sample_keys: np.ndarray,
+        *,
+        batch_size: int,
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        for batch in self._storage.iter_key_batches(sample_keys, batch_size=batch_size):
+            yield batch.inputs, batch.outputs
+
+    def _evaluate_matrices_for_keys(
+        self,
+        matrices: Sequence[np.ndarray],
+        sample_keys: np.ndarray,
+        tolerances: np.ndarray,
+        *,
+        batch_size: int,
+    ) -> dict[str, float | int]:
+        return evaluate_matrices_batches(
+            self._iter_input_output_batches(sample_keys, batch_size=batch_size),
+            matrices,
+            tolerances,
+        )
+
     def _ensure_model_pool(
         self,
         input_size: int,
         output_size: int,
-        inputs: np.ndarray,
-        outputs: np.ndarray,
+        validation_keys: np.ndarray,
         tolerances: np.ndarray,
         rng: np.random.Generator,
+        *,
+        batch_size: int,
     ) -> None:
         if self._storage.list_models():
             return
         matrix = random_matrix(input_size + 1, output_size, rng)
         matrices = [matrix]
-        metrics = evaluate_matrices(inputs, outputs, matrices, tolerances)
+        metrics = self._evaluate_matrices_for_keys(
+            matrices,
+            validation_keys,
+            tolerances,
+            batch_size=batch_size,
+        )
         self._storage.save_model(matrices, metrics=metrics)
 
 
-def _validation_count(accepted_count: int, dataset_size: int) -> int:
-    if dataset_size < 2:
-        raise ValueError("training requires at least two dataset samples")
-    return min(max(accepted_count, 1), dataset_size - 1)
+def _validate_train_ratio(train_ratio: object) -> float:
+    try:
+        ratio = float(train_ratio)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "train_ratio must be finite and greater than 0 and less than 1"
+        ) from exc
+    if not math.isfinite(ratio) or not 0.0 < ratio < 1.0:
+        raise ValueError("train_ratio must be finite and greater than 0 and less than 1")
+    return ratio

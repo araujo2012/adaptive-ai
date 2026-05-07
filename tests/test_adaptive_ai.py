@@ -1,9 +1,11 @@
+import threading
 import time
 
 import numpy as np
 import pytest
 
 from adaptive_ai import AdaptiveAI
+import adaptive_ai.api as api_module
 
 
 def wait_for_job(ai, job_id, timeout=5.0):
@@ -25,17 +27,23 @@ def test_workspace_is_created_with_sqlite_and_array_directories(tmp_path):
     assert (tmp_path / ".adaptive_ai" / "models").is_dir()
 
 
-def test_set_and_put_input_output_persist_float64_dataset(tmp_path):
+def test_set_and_put_input_output_persist_float64_streaming_dataset(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
 
     ai.set_input_output([[0, 0], [1, 1]], [[0], [1]])
     ai.put_input_output([[1, 0]], [[1]])
 
     dataset = ai.get_dataset()
-    assert dataset["inputs"].dtype == np.float64
-    assert dataset["outputs"].dtype == np.float64
-    np.testing.assert_allclose(dataset["inputs"], [[0, 0], [1, 1], [1, 0]])
-    np.testing.assert_allclose(dataset["outputs"], [[0], [1], [1]])
+    assert dataset.sample_count == 3
+    assert dataset.input_size == 2
+    assert dataset.output_size == 1
+
+    batches = list(dataset.iter_batches(batch_size=10))
+    assert len(batches) == 1
+    assert batches[0].inputs.dtype == np.float64
+    assert batches[0].outputs.dtype == np.float64
+    np.testing.assert_allclose(batches[0].inputs, [[0, 0], [1, 1], [1, 0]])
+    np.testing.assert_allclose(batches[0].outputs, [[0], [1], [1]])
 
 
 def test_rejects_incompatible_dimensions_and_outputs_outside_sigmoid_range(tmp_path):
@@ -178,6 +186,46 @@ def test_training_job_can_be_paused_and_canceled(tmp_path):
     assert canceled_finished["status"] == "canceled"
 
 
+def test_set_input_output_rejects_replacement_while_training_is_running(
+    tmp_path, monkeypatch
+):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1], [2], [3]], [[0], [0], [1], [1]])
+
+    training_entered = threading.Event()
+    release_training = threading.Event()
+    original_train_matrices_batches = api_module.train_matrices_batches
+
+    def pause_batch_training(*args, **kwargs):
+        training_entered.set()
+        if not release_training.wait(timeout=5):
+            raise TimeoutError("training release was not signaled")
+        return original_train_matrices_batches(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "train_matrices_batches", pause_batch_training)
+    job = ai.start_training(
+        max_seconds=5.0,
+        tolerances=[0.2],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.1,
+        seed=7,
+    )
+    assert training_entered.wait(timeout=5)
+
+    with pytest.raises(
+        ValueError,
+        match="cannot replace dataset while a training job is running",
+    ):
+        ai.set_input_output([[9], [10]], [[1], [0]])
+
+    release_training.set()
+    ai.cancel_training(job["job_id"])
+    finished = wait_for_job(ai, job["job_id"])
+    assert finished["status"] == "canceled"
+    assert "error" in finished
+
+
 def test_get_model_returns_matrices_and_mutation_prunes_pool_to_sqrt_dataset(tmp_path):
     ai = AdaptiveAI(path=tmp_path)
     ai.set_input_output(
@@ -200,3 +248,86 @@ def test_get_model_returns_matrices_and_mutation_prunes_pool_to_sqrt_dataset(tmp
     model = ai.get_model(models[0]["model_id"])
     assert model["matrices"]
     assert all(matrix.dtype == np.float64 for matrix in model["matrices"])
+
+
+def test_training_job_streams_batches_without_loading_full_dataset(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0], [1], [2], [3], [4]],
+        [[0], [0], [1], [1], [1]],
+        sample_ids=[f"sample-{index}" for index in range(5)],
+    )
+
+    job = ai.start_training(
+        max_seconds=0.2,
+        tolerances=[0.95],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.05,
+        seed=5,
+        train_ratio=0.8,
+        batch_size=2,
+    )
+    finished = wait_for_job(ai, job["job_id"])
+
+    assert finished["status"] == "completed"
+    assert finished["rounds_completed"] >= 1
+    assert finished["train_ratio"] == 0.8
+    assert finished["batch_size"] == 2
+
+
+def test_start_training_normalizes_train_ratio_before_persisting(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output(
+        [[0], [1], [2], [3]],
+        [[0], [0], [1], [1]],
+        sample_ids=[f"ratio-{index}" for index in range(4)],
+    )
+
+    job = ai.start_training(
+        max_seconds=0.2,
+        tolerances=[0.95],
+        amount_strategy="fixed",
+        fixed_steps=1,
+        learning_rate=0.05,
+        seed=6,
+        train_ratio="0.5",
+        batch_size=2,
+    )
+    finished = wait_for_job(ai, job["job_id"])
+
+    assert finished["status"] == "completed"
+    assert finished["train_ratio"] == 0.5
+
+
+def test_start_training_rejects_invalid_train_ratio_with_value_error(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+
+    with pytest.raises(
+        ValueError,
+        match="train_ratio must be finite and greater than 0 and less than 1",
+    ):
+        ai.start_training(
+            max_seconds=0.2,
+            tolerances=[0.95],
+            amount_strategy="fixed",
+            fixed_steps=1,
+            learning_rate=0.05,
+            train_ratio="half",
+            batch_size=2,
+        )
+
+
+def test_streaming_dataset_public_usage_smoke(tmp_path):
+    ai = AdaptiveAI(path=tmp_path)
+    ai.set_input_output([[0], [1]], [[0], [1]], sample_ids=["left", "right"])
+
+    dataset = ai.get_dataset()
+    first_batch = next(dataset.iter_batches(batch_size=1))
+    selected = ai.get_samples(["right"])
+
+    assert dataset.sample_count == 2
+    assert first_batch.sample_ids == ["left"]
+    assert selected.sample_ids == ["right"]
+    np.testing.assert_allclose(selected.outputs, [[1]])
